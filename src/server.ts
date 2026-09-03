@@ -18,7 +18,6 @@ import { expandPreviousResponseInput, rememberResponseState } from "./responses/
 import { parseRequest } from "./responses/parser";
 import { UpstreamClient } from "./freebuff/upstream";
 import { AccountPool, FreebuffAccount, errorText } from "./freebuff/pool";
-import { usagePanelScript } from "./usage-panel";
 import { ModelRegistry, PREMIUM_SESSION_LIMIT } from "./freebuff/models";
 import { buildFreebuffModelCatalog } from "./models-catalog";
 import { COMPACT_PROMPT } from "./responses/compaction";
@@ -408,15 +407,6 @@ async function routeRequest(
   if (path === "/v1/responses" && request.method === "POST") return await handleResponses(request, runtime);
   if (path === "/healthz" && request.method === "GET") return await handleHealthz(runtime);
   if (path === "/usage" && request.method === "GET") return await handleUsage(runtime);
-  if (path === "/usage.js" && request.method === "GET") {
-    return new Response(usagePanelScript, {
-      headers: {
-        "content-type": "text/javascript; charset=utf-8",
-        "access-control-allow-origin": "*",
-        "cache-control": "no-cache",
-      },
-    });
-  }
   if (path === "/notifications" && request.method === "GET") {
     return json({ notifications: runtime.pool.recentNotifications() });
   }

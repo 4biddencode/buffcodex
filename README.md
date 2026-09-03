@@ -1,6 +1,6 @@
 # Buffcodex
 
-**Run Codex on every free Freebuff model — with multiple accounts, concurrent chats, and a live per-account usage panel.**
+**Run Codex on every free Freebuff model — with multiple accounts and concurrent chats.**
 
 Buffcodex is a standalone local Responses bridge. Codex talks to it exactly like it talks to
 OpenAI; Buffcodex routes every turn through the Freebuff backend's free tier using a pool of
@@ -21,9 +21,6 @@ Codex ──Responses + SSE──▶ buffcodex (127.0.0.1:17999) ──chat-comp
   round-robin across accounts, so parallel Codex chats actually run in parallel and no single
   account's free quota burns out first. Waiting-room states, cooldowns, and run lifecycle are
   handled per account automatically.
-- **In-app usage panel.** The ChatGPT app's bottom-left account menu (patched via
-  `tools/patch-chatgpt-app.sh`) shows each account's status, token burn, and remaining
-  free-session window — the "rest = remaining quota" picture at a glance.
 - **Full Codex tool harness.** Shell, apply_patch, MCP namespaces, tool_search, images, and
   remote compaction v2 all work through standard chat-completions tool calling.
 - **Drop-in install.** `buffcodex codex install` points Codex at the bridge (a reversible,
@@ -33,6 +30,20 @@ Codex ──Responses + SSE──▶ buffcodex (127.0.0.1:17999) ──chat-comp
 
 Requires [Bun](https://bun.sh) 1.4+.
 
+### One-shot install (macOS)
+
+From a checkout of this repo:
+
+```bash
+tools/install-mac.sh
+```
+
+That builds the binary, puts `buffcodex` on your PATH, installs + starts the background
+service (LaunchAgent), routes Codex through the bridge, and restarts the ChatGPT app with
+the new model catalog. Re-run it any time after updating — accounts in
+`~/.buffcodex/config.json` are never touched.
+
+### Manual install
 ```bash
 cd buffcodex
 bun install
@@ -77,10 +88,9 @@ and removed from the pool + config on the spot.
 
 ## Usage API
 
-Open `http://127.0.0.1:17999/` while serving:
+Open `http://127.0.0.1:17999/usage` while serving:
 
-- **Per-account usage + session/run snapshots** (`GET /usage`), served with CORS so the
-  ChatGPT-app panel can poll it.
+- **Per-account usage + session/run snapshots** (`GET /usage`).
 - **Add account** — `POST /accounts` validates a token against the Freebuff backend before it
   joins the pool.
 
@@ -88,7 +98,6 @@ Programmatic access:
 
 ```
 GET /usage      per-account usage + session/run snapshots
-GET /usage.js   injection script for the ChatGPT-app usage panel
 GET /healthz    liveness + the same snapshots
 POST /accounts  {"action":"add","token":"…"} | {"action":"remove","name":"account-2"}
 ```
@@ -174,9 +183,7 @@ The registry also parses the upstream tier lists each refresh:
 | `paused` | recognized upstream but served to nobody | filtered out of `/v1/models` |
 
 Notifications (renewals, waiting-room queue moves, cooldowns, premium/limited model use,
-renewal failures) flow through a bounded ring buffer, exposed at `GET /notifications`, streamed
-incrementally via `GET /usage?since=` for the usage panel, and surfaced as a notification
-plus a premium badge in the usage dock.
+renewal failures) flow through a bounded ring buffer, exposed at `GET /notifications`,streamed incrementally via `GET /usage?since=`.
 
 ## Tests
 
@@ -191,6 +198,9 @@ notification hub, tier parsing, the registry parser (both upstream formats), and
 server turns against a mocked upstream.
 
 ## Disclaimer
+
+This project is for **educational purposes only**, and we are **not liable** for any malicious
+actions done by people using it.
 
 Independent software, not affiliated with Codebuff, Freebuff, or OpenAI. Use with your own
 accounts and in accordance with their terms. Free-tier routing depends on undocumented upstream
