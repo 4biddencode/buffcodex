@@ -1,0 +1,17 @@
+# dependencies
+node_modules/
+
+# build artifacts
+dist/
+
+# captured reverse-engineered CLI binary (99 MB, not source)
+cli
+
+# local capture/debug output
+*.log
+*.jsonl
+capture.jsonl
+
+# environment / secrets
+.env
+.env.*
