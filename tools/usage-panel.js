@@ -80,7 +80,7 @@
         <span class="bcx-dot ${escapeAttr(status)}" title="${escapeAttr(status)}"></span>
         <div style="flex:1;min-width:0">
           <div class="bcx-name">${escapeHtml(acc.name)} <span style="color:rgba(255,255,255,0.35)">${escapeHtml(acc.maskedToken || "")}</span></div>
-          <div class="bcx-bar" title="free session window: ${frac}% left"><i style="width:${frac}%"></i></div>
+          <div class="bcx-bar" title="free session window: ${frac}% of the hour left"><i style="width:${frac}%"></i></div>
           ${err}
         </div>
         <span class="bcx-meta" title="${escapeAttr(status)}">${escapeHtml(meta)}</span>

@@ -28,7 +28,7 @@ export const usagePanelScript = String.raw`
         const meta=status==="queued"?("#"+((acc.session&&acc.session.position||0)+1)+" in queue"):(fmtTokens(acc.usage&&acc.usage.totalTokens||0)+" tok \u00b7 "+(acc.usage&&acc.usage.requestCount||0)+" req");
         const frac=Math.round(windowFraction(acc)*100);
         const err=status==="error"&&acc.lastError?('<div class="bcx-err" title="'+esc(acc.lastError)+'">'+esc(acc.lastError)+"</div>"):"";
-        return '<div class="bcx-row"><span class="bcx-dot '+esc(status)+'" title="'+esc(status)+'"></span><div style="flex:1;min-width:0"><div class="bcx-name">'+esc(acc.name)+' <span style="color:rgba(255,255,255,.35)">'+esc(acc.maskedToken||"")+'</span></div><div class="bcx-bar" title="free session window: '+frac+'% left"><i style="width:'+frac+'%"></i></div>'+err+'</div><span class="bcx-meta">'+esc(meta)+"</span></div>";
+        return '<div class="bcx-row"><span class="bcx-dot '+esc(status)+'" title="'+esc(status)+'"></span><div style="flex:1;min-width:0"><div class="bcx-name">'+esc(acc.name)+' <span style="color:rgba(255,255,255,.35)">'+esc(acc.maskedToken||"")+'</span></div><div class="bcx-bar" title="free session window: '+frac+'% of the hour left"><i style="width:'+frac+'%"></i></div>'+err+'</div><span class="bcx-meta">'+esc(meta)+"</span></div>";
       }).join("")||'<div class="bcx-row">no accounts \u2014 is the bridge running?</div>');
   }
   async function poll(){

@@ -33,6 +33,61 @@ describe("banned account handling", () => {
     expect(AccountPool.isBannedBody(200, '{"status":"banned"}')).toBe(false);
   });
 
+  test("parseRateLimited reads the daily/weekly quota refusal", () => {
+    const body = JSON.stringify({
+      status: "rate_limited",
+      period: "pacific_day",
+      resetAt: new Date(Date.now() + 3_600_000).toISOString(),
+      limit: 12,
+      recentCount: 12,
+    });
+    const parsed = AccountPool.parseRateLimited(body);
+    expect(parsed).not.toBeNull();
+    expect(parsed!.period).toBe("pacific_day");
+    expect(parsed!.limit).toBe(12);
+    expect(parsed!.resetAtMs).toBeGreaterThan(Date.now());
+
+    expect(AccountPool.parseRateLimited('{"status":"banned"}')).toBeNull();
+    expect(AccountPool.parseRateLimited("garbage")).toBeNull();
+  });
+
+  test("rate_limited admission cools the account down until reset (not removal)", async () => {
+    const client = {
+      startRun: async () => "run_1",
+      finishRun: async () => {},
+      createOrRefreshSession: async (): Promise<SessionState> => {
+        throw new UpstreamError(JSON.stringify({
+          status: "rate_limited",
+          period: "pacific_day",
+          resetAt: new Date(Date.now() + 60_000).toISOString(),
+          limit: 10,
+        }), 429);
+      },
+      getSession: async (): Promise<SessionState> => {
+        throw new UpstreamError("nope", 500);
+      },
+      endSession: async () => {},
+      chatCompletions: async () => ({ response: new Response("{}", { status: 200 }) }),
+    } as unknown as UpstreamClient;
+
+    const account = makeAccount("account-1", client);
+    const pool = new AccountPool([account]);
+    let persisted = 0;
+    pool.onAccountsChanged = () => { persisted += 1; };
+    const notes: PoolNotification[] = [];
+    pool.subscribe(n => notes.push(n));
+
+    await expect(account.acquire("base2-free", "z-ai/glm-5.3-flash")).rejects.toThrow();
+    await new Promise(resolve => setTimeout(resolve, 20));
+
+    // NOT removed — it comes back at reset.
+    expect(account.isBanned).toBe(false);
+    expect(pool.size).toBe(1);
+    expect(persisted).toBe(0);
+    expect(account.unavailableReason()).toContain("cooling down");
+    expect(notes.some(n => n.kind === "cooldown" && n.level === "warn")).toBe(true);
+  });
+
   test("markBanned notifies, cools down and triggers pool removal + persistence", async () => {
     const client = {
       startRun: async () => "run_1",

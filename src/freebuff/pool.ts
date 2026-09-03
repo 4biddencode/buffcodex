@@ -550,6 +550,16 @@ export class FreebuffAccount {
         this.markBanned(error.status === 401 ? "invalid token (upstream 401)" : "banned (session admission)");
         throw error;
       }
+      // Daily/weekly free quota exhausted: park the account until the Pacific-period
+      // reset instead of hammering admission (upstream sends resetAt/retryAfterMs).
+      if (error instanceof UpstreamError) {
+        const rateLimited = AccountPool.parseRateLimited(error.message);
+        if (rateLimited) {
+          const until = rateLimited.resetAtMs > Date.now() ? rateLimited.resetAtMs : Date.now() + 15 * 60_000;
+          this.markCooldown(until - Date.now(), `free quota used up — resets ${new Date(until).toLocaleString()}`);
+          this.emitNotification("cooldown", "warn", `free quota exhausted (${rateLimited.period}) — paused until ${new Date(until).toLocaleString()}`);
+        }
+      }
       throw error;
     }
     await this.applySessionState(state, signal);
@@ -691,6 +701,35 @@ export class AccountPool {
       return parsed?.status === "banned";
     } catch {
       return false;
+    }
+  }
+
+  /**
+   * Parse a `rate_limited` session-admission refusal (daily/weekly free-quota exhausted).
+   * Returns null when the body is not a rate_limited refusal.
+   */
+  static parseRateLimited(errorBody: string): { period: "pacific_day" | "pacific_week"; resetAtMs: number; limit: number } | null {
+    const trimmed = errorBody.trim();
+    if (!trimmed) return null;
+    try {
+      const parsed = JSON.parse(trimmed) as {
+        status?: unknown;
+        period?: unknown;
+        resetAt?: unknown;
+        retryAfterMs?: unknown;
+        limit?: unknown;
+      } | null;
+      if (parsed?.status !== "rate_limited") return null;
+      const period = parsed.period === "pacific_week" ? "pacific_week" : "pacific_day";
+      const resetAtMs = parseOptionalTimeMs(typeof parsed.resetAt === "string" ? parsed.resetAt : undefined)
+        ?? (typeof parsed.retryAfterMs === "number" ? Date.now() + parsed.retryAfterMs : 0);
+      return {
+        period,
+        resetAtMs,
+        limit: typeof parsed.limit === "number" ? parsed.limit : 0,
+      };
+    } catch {
+      return null;
     }
   }
 
