@@ -50,7 +50,7 @@ function ensureConfig(): BuffcodexConfig {
     // the user adds tokens from the dashboard at http://127.0.0.1:17999/.
     const config = defaultConfig();
     saveConfig(config);
-    console.info(`created ${getConfigPath()} with no accounts — add one at the dashboard or via:\n  buffcodex accounts add <auth-token>`);
+    console.info(`created ${getConfigPath()} with no accounts — add one via:\n  buffcodex accounts add <auth-token>`);
     return config;
   }
   try {
@@ -246,7 +246,7 @@ async function cmdServe(): Promise<void> {
       })()
     : config;
   const runtime = createRuntime(secured);
-  // Live account changes (dashboard) persist straight back to config.json.
+  // Live account changes (dashboard/panel) persist straight back to config.json.
   runtime.onAccountsChanged = () => {
     try {
       saveConfig({ ...runtime.config, authTokens: runtime.pool.listAccounts().map(account => account.revealToken()) });
@@ -275,7 +275,7 @@ async function cmdServe(): Promise<void> {
   process.on("SIGINT", () => void shutdown());
   process.on("SIGTERM", () => void shutdown());
   const dashboards = listenHosts(secured.host, secured.port);
-  console.info(`serving ${secured.authTokens.length} account(s) — dashboard: ${dashboards[0]} — press Ctrl+C to stop`);
+  console.info(`serving ${secured.authTokens.length} account(s) — usage API: ${dashboards[0]} — press Ctrl+C to stop`);
   if (dashboards.length > 1) console.info(`also reachable at: ${dashboards.slice(1).join(", ")}`);
 }
 

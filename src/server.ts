@@ -18,7 +18,7 @@ import { expandPreviousResponseInput, rememberResponseState } from "./responses/
 import { parseRequest } from "./responses/parser";
 import { UpstreamClient } from "./freebuff/upstream";
 import { AccountPool, FreebuffAccount, errorText } from "./freebuff/pool";
-import { renderDashboard } from "./dashboard";
+import { usagePanelScript } from "./usage-panel";
 import { ModelRegistry, PREMIUM_SESSION_LIMIT } from "./freebuff/models";
 import { buildFreebuffModelCatalog } from "./models-catalog";
 import { COMPACT_PROMPT } from "./responses/compaction";
@@ -54,13 +54,16 @@ export function createRuntime(config: BuffcodexConfig): Runtime {
     requestTimeoutMs: config.requestTimeoutMs,
   }));
   const pool = new AccountPool(accounts);
+  // Banned-account removal mutates the pool directly — persist it like live add/remove.
+  pool.onAccountsChanged = () => runtime.onAccountsChanged?.();
   const registry = new ModelRegistry();
   const adapter = createFreebuffAdapter({
     pool,
     resolveAgentId: modelId => registry.agentForModel(modelId) ?? "base2-free",
     resolveModelTier: modelId => registry.tierFor(modelId),
   });
-  return { config, client, pool, registry, adapter, startedAt: Date.now(), usageRequestState: { lastPollMs: Date.now() } };
+  const runtime: Runtime = { config, client, pool, registry, adapter, startedAt: Date.now(), usageRequestState: { lastPollMs: Date.now() } };
+  return runtime;
 }
 
 function json(body: unknown, status = 200, headers: Record<string, string> = {}): Response {
@@ -274,7 +277,7 @@ function accountSnapshots(runtime: Runtime) {
           ? "error"
           : "ok",
     lastError: snapshot.lastError || undefined,
-    session: snapshot.session ? { status: snapshot.session.status, position: snapshot.session.position, queueDepth: snapshot.session.queueDepth } : undefined,
+    session: snapshot.session ? { status: snapshot.session.status, position: snapshot.session.position, queueDepth: snapshot.session.queueDepth, expiresAtMs: snapshot.session.expiresAtMs } : undefined,
     runs: snapshot.runs.map(run => ({ agentId: run.agentId, inflight: run.inflight, requestCount: run.requestCount })),
     usage: {
       requestCount: snapshot.usage.requestCount,
@@ -294,7 +297,7 @@ async function handleUsage(runtime: Runtime): Promise<Response> {
     accounts: accountSnapshots(runtime),
     notifications: runtime.pool.recentNotifications(sinceMs),
     premiumSessionLimit: PREMIUM_SESSION_LIMIT,
-  });
+  }, 200, { "access-control-allow-origin": "*" });
 }
 
 async function handleHealthz(runtime: Runtime): Promise<Response> {
@@ -398,13 +401,22 @@ async function routeRequest(
   path: string,
   url: URL,
 ): Promise<Response> {
-  if (path === "/" && request.method === "GET") return new Response(renderDashboard(runtime.config.port), {
-    headers: { "content-type": "text/html; charset=utf-8" },
-  });
+  if (path === "/" && request.method === "GET") {
+    return json({ ok: true, hint: "dashboard removed — see /usage, /healthz, /v1/models" });
+  }
   if (path === "/v1/models" && request.method === "GET") return await handleModels(runtime);
   if (path === "/v1/responses" && request.method === "POST") return await handleResponses(request, runtime);
   if (path === "/healthz" && request.method === "GET") return await handleHealthz(runtime);
   if (path === "/usage" && request.method === "GET") return await handleUsage(runtime);
+  if (path === "/usage.js" && request.method === "GET") {
+    return new Response(usagePanelScript, {
+      headers: {
+        "content-type": "text/javascript; charset=utf-8",
+        "access-control-allow-origin": "*",
+        "cache-control": "no-cache",
+      },
+    });
+  }
   if (path === "/notifications" && request.method === "GET") {
     return json({ notifications: runtime.pool.recentNotifications() });
   }

@@ -19,7 +19,8 @@ export type NotificationKind =
   | "premium_model"
   | "limited_model"
   | "cooldown"
-  | "account_error";
+  | "account_error"
+  | "account_removed";
 
 export interface PoolNotification {
   id: string;
@@ -128,6 +129,10 @@ export class FreebuffAccount {
   private userId: string | undefined;
   private cooldownUntilMs = 0;
   private lastError = "";
+  /** Set once upstream answers any call with {"status":"banned"} — account is dead. */
+  private banned = false;
+  /** Invoked by markBanned so the pool can remove the account and persist config. */
+  private onBanned: ((account: FreebuffAccount) => void) | null = null;
   /** Armed timer that renews the free session just before upstream expiry. */
   private renewalTimer: ReturnType<typeof setTimeout> | null = null;
   /** Armed timer that re-polls a queued (waiting-room) session. */
@@ -305,6 +310,28 @@ export class FreebuffAccount {
 
   setNotifier(notify: (notification: PoolNotification) => void): void {
     this.notify = notify;
+  }
+
+  /**
+   * Upstream considers this account banned (`{"status":"banned"}` in any error body),
+   * OR the token is invalid (401 on admission/chat — rotated or revoked server-side).
+   * Both are permanent — mark, notify, and let the pool drop + persist the removal.
+   */
+  markBanned(reason: string): void {
+    if (this.banned) return;
+    this.banned = true;
+    this.markCooldown(24 * 60 * 60_000, reason);
+    this.emitNotification("account_removed", "error", `account invalid upstream — removed from pool (${reason})`);
+    this.onBanned?.(this);
+  }
+
+  get isBanned(): boolean {
+    return this.banned;
+  }
+
+  /** Called by the pool so the account can trigger its own removal + persistence. */
+  setBannedCallback(onBanned: (account: FreebuffAccount) => void): void {
+    this.onBanned = onBanned;
   }
 
   private emitNotification(
@@ -516,11 +543,12 @@ export class FreebuffAccount {
       this.session = null;
       this.sessionModel = undefined;
       this.lastError = errorText(error);
-      // A token the upstream rejects on SESSION ADMISSION is dead (rotated server-side).
-      // Cooldown so acquire() skips it and maintenance stops hammering /session every
-      // cycle — same backoff philosophy as the CLI's 429 handling.
-      if (error instanceof UpstreamError && error.status === 401) {
-        this.markCooldown(30 * 60_000, "upstream auth rejected token");
+      // A token the upstream rejects on SESSION ADMISSION is dead (rotated or revoked
+      // server-side, or the account got banned). Remove it from the pool entirely and
+      // persist the removal — cooldown alone would keep the dead token in config forever.
+      if (error instanceof UpstreamError && (error.status === 401 || AccountPool.isBannedBody(error.status, error.message))) {
+        this.markBanned(error.status === 401 ? "invalid token (upstream 401)" : "banned (session admission)");
+        throw error;
       }
       throw error;
     }
@@ -630,8 +658,40 @@ export class AccountPool {
   constructor(accounts: FreebuffAccount[]) {
     this.accounts = accounts;
     const forward = (notification: PoolNotification) => this.pushNotification(notification);
-    for (const account of accounts) account.setNotifier(forward);
+    for (const account of accounts) {
+      account.setNotifier(forward);
+      account.setBannedCallback(banned => void this.handleBanned(banned));
+    }
     this.notifierForNewAccounts = forward;
+  }
+
+  /**
+   * A banned account is removed from the pool immediately (its leases die with it) and
+   * the change is persisted via onAccountsChanged so the dead token leaves config.json.
+   */
+  private async handleBanned(account: FreebuffAccount): Promise<void> {
+    if (!this.accounts.includes(account)) return;
+    console.warn(`[${account.name}] banned upstream — removing from pool`);
+    this.accounts = this.accounts.filter(a => a !== account);
+    if (this.nextIndex >= this.accounts.length) this.nextIndex = 0;
+    await account.shutdown().catch(() => {});
+    this.onAccountsChanged?.();
+  }
+
+  /** Fired after a banned account has been dropped; runtime persists the token list. */
+  onAccountsChanged?: () => void;
+
+  /** Whether an upstream error body marks the account as permanently banned. */
+  static isBannedBody(status: number, errorBody: string): boolean {
+    if (status < 400) return false;
+    const trimmed = errorBody.trim();
+    if (!trimmed) return false;
+    try {
+      const parsed = JSON.parse(trimmed) as { status?: unknown } | null;
+      return parsed?.status === "banned";
+    } catch {
+      return false;
+    }
   }
 
   private notifierForNewAccounts: (notification: PoolNotification) => void;
@@ -681,6 +741,7 @@ export class AccountPool {
   /** Append a live account; takes effect on the next acquire. */
   addAccount(account: FreebuffAccount): void {
     account.setNotifier(this.notifierForNewAccounts);
+    account.setBannedCallback(banned => void this.handleBanned(banned));
     this.accounts.push(account);
   }
 

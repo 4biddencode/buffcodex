@@ -21,9 +21,9 @@ Codex ──Responses + SSE──▶ buffcodex (127.0.0.1:17999) ──chat-comp
   round-robin across accounts, so parallel Codex chats actually run in parallel and no single
   account's free quota burns out first. Waiting-room states, cooldowns, and run lifecycle are
   handled per account automatically.
-- **Live usage panel.** The dashboard at `http://127.0.0.1:17999/` keeps a per-account usage
-  dock pinned to the **bottom-left**: each account's token burn, request count, share of pool
-  traffic, and time since it last served — the "rest = remaining quota" picture at a glance.
+- **In-app usage panel.** The ChatGPT app's bottom-left account menu (patched via
+  `tools/patch-chatgpt-app.sh`) shows each account's status, token burn, and remaining
+  free-session window — the "rest = remaining quota" picture at a glance.
 - **Full Codex tool harness.** Shell, apply_patch, MCP namespaces, tool_search, images, and
   remote compaction v2 all work through standard chat-completions tool calling.
 - **Drop-in install.** `buffcodex codex install` points Codex at the bridge (a reversible,
@@ -61,7 +61,7 @@ Log in with several Freebuff accounts and add every token — that is the whole 
 ## CLI
 
 ```
-buffcodex serve                    start the Responses bridge (dashboard at /)
+buffcodex serve                    start the Responses bridge (usage API at /usage)
 buffcodex accounts add <token>     validate + save a Freebuff auth token
 buffcodex accounts list            list configured accounts
 buffcodex accounts remove <n>      remove account n (1-based)
@@ -71,25 +71,26 @@ buffcodex codex install            route Codex through the bridge (backs up conf
 buffcodex codex remove             restore the previous Codex routing
 ```
 
-Accounts can also be added/removed **live** from the dashboard while the bridge keeps serving;
-changes are persisted to `config.json` automatically.
+Accounts can also be added/removed **live** via `POST /accounts` (the bridge persists changes
+straight back to `config.json`). Banned or invalid (401) accounts are detected automatically
+and removed from the pool + config on the spot.
 
-## Dashboard & usage API
+## Usage API
 
 Open `http://127.0.0.1:17999/` while serving:
 
-- **Bottom-left usage dock** — per-account usage, share-of-traffic bars, last-served time.
-  Click the header to collapse; the preference persists.
-- **Accounts table** — status, free-session state, requests, tokens in/out, remove buttons.
-- **Add account** — paste a token; it is validated against the Freebuff backend before joining
-  the pool.
+- **Per-account usage + session/run snapshots** (`GET /usage`), served with CORS so the
+  ChatGPT-app panel can poll it.
+- **Add account** — `POST /accounts` validates a token against the Freebuff backend before it
+  joins the pool.
 
 Programmatic access:
 
 ```
-GET /usage     per-account usage + session/run snapshots (powers the dock)
-GET /healthz   liveness + the same snapshots
-POST /accounts {"action":"add","token":"…"} | {"action":"remove","name":"account-2"}
+GET /usage      per-account usage + session/run snapshots
+GET /usage.js   injection script for the ChatGPT-app usage panel
+GET /healthz    liveness + the same snapshots
+POST /accounts  {"action":"add","token":"…"} | {"action":"remove","name":"account-2"}
 ```
 
 ## Configuration
@@ -174,7 +175,7 @@ The registry also parses the upstream tier lists each refresh:
 
 Notifications (renewals, waiting-room queue moves, cooldowns, premium/limited model use,
 renewal failures) flow through a bounded ring buffer, exposed at `GET /notifications`, streamed
-incrementally via `GET /usage?since=` for the dashboard, and surfaced as a top-right banner
+incrementally via `GET /usage?since=` for the usage panel, and surfaced as a notification
 plus a premium badge in the usage dock.
 
 ## Tests

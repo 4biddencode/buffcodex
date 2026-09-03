@@ -5,7 +5,7 @@
 import type { IncomingMeta, ProviderAdapter } from "../base";
 import type { AdapterEvent, CodexParsedRequest, CodexUsage } from "../../types";
 import { adapterFailureFromMessage } from "../../lib/errors";
-import { AccountLease, WaitingRoomError, errorText, type AccountPool } from "../../freebuff/pool";
+import { AccountLease, AccountPool, WaitingRoomError, errorText } from "../../freebuff/pool";
 import { UpstreamError } from "../../freebuff/upstream";
 import {
   buildChatCompletionRequest,
@@ -142,6 +142,14 @@ export function createFreebuffAdapter(options: FreebuffAdapterOptions): Provider
         }
 
         if ("errorBody" in result) {
+          // Upstream says this account is banned — drop it from the pool (persists to
+          // config) and retry the turn on another account.
+          if (AccountPool.isBannedBody(result.status, result.errorBody)) {
+            account.markBanned("banned (chat completion)");
+            await lease.release().catch(() => {});
+            lastFailure = { message: result.errorBody, status: result.status };
+            continue;
+          }
           if (isSessionInvalid(result.status, result.errorBody)) {
             console.warn(`[${account.name}] free session invalid, refreshing and retrying`);
             account.invalidateSession(result.errorBody.trim());
@@ -156,8 +164,12 @@ export function createFreebuffAdapter(options: FreebuffAdapterOptions): Provider
             continue;
           }
           if (result.status === 401) {
-            account.markCooldown(30 * 60_000, "upstream auth rejected token");
-            account.invalidateSession("upstream auth rejected token");
+            // Token rejected mid-chat — same verdict as admission 401: the account is
+            // dead. markBanned removes it from the pool and persists the removal.
+            account.markBanned("invalid token (upstream 401 on chat)");
+            await lease.release().catch(() => {});
+            lastFailure = { message: result.errorBody || "upstream auth rejected token", status: result.status };
+            continue;
           }
           await lease.release();
           emitUpstreamFailure(emit, result.status, result.errorBody);
