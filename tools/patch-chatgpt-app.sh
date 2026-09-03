@@ -45,16 +45,19 @@ HTML="$WORK/asar/webview/index.html"
 if ! grep -q 'usage-panel.js' "$HTML"; then
   # Insert before the first <script tag so it runs before app code.
   python3 - "$HTML" "$BRIDGE_URL" <<'PYEOF'
-import sys
+import re, sys
 html_path, bridge = sys.argv[1], sys.argv[2]
 html = open(html_path, encoding="utf-8").read()
 tag = f'<script src="./assets/usage-panel.js"></script>'
 html = html.replace("<script", f"{tag}<script", 1)
-# Extend CSP so the panel may call the local bridge.
-html = html.replace("connect-src &#x27;self&#x27;", f"connect-src &#x27;self&#x27; {bridge}")
-html = html.replace("connect-src 'self'", f"connect-src 'self' {bridge}")
+# Extend CSP so the panel may call the local bridge. The apostrophes around 'self'
+# can be encoded as &#x27; or &#39; — insert our origin right after the directive
+# name instead, which works regardless of encoding.
+html, n = re.subn(r"connect-src(\s)", rf"connect-src \1{bridge} ", html, count=1)
+if n != 1:
+    sys.exit("could not find connect-src directive in CSP")
 open(html_path, "w", encoding="utf-8").write(html)
-print("patched index.html")
+print("patched index.html (CSP extended with " + bridge + ")")
 PYEOF
 fi
 
