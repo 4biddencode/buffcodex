@@ -1,30 +1,29 @@
 /**
- * Buffcodex model multiplexer — does EXACTLY what codex-chatgpt-web's
+ * Commandcodex model multiplexer — does EXACTLY what codex-chatgpt-web's
  * augmentNativeModelCatalog + buildChatGptWebModel do, just one hop further out:
  *
- * 1. Fetch the chatgpt-web bridge's /v1/models (the augmented native catalog: native rows
- *    + chatgpt-web/* rows), passing the caller's Bearer through — untouched, byte for byte.
- * 2. Select a native template row (list-visible, with reasoning metadata) — same rules as
- *    selectNativeTemplate.
- * 3. Build one Freebuff row per model with buildChatGptWebModel's recipe: a
- *    structuredClone of the template with identity/reasoning/context overrides,
- *    tool_mode/upgrade null, empty service tiers, comp_hash + availability_nux deleted.
- * 4. Return { ...catalog, models: [...catalog.models, ...freebuffRows] } — the full
+ * 1. Fetch the chatgpt-web bridge's /v1/models (the augmented native catalog), passing
+ *    the caller's Bearer through — untouched, byte for byte.
+ * 2. Select a native template row (list-visible, with reasoning metadata).
+ * 3. Build one commancodex row per model: a structuredClone of the template with
+ *    identity/reasoning/context overrides, tool_mode/upgrade null, empty service tiers,
+ *    comp_hash + availability_nux deleted.
+ * 4. Return { ...catalog, models: [...catalog.models, ...commancodexRows] } — the full
  *    catalog object preserved, rows only appended.
  *
- * /v1/responses is routed by model slug: chatgpt-web/native → 17841, Freebuff → 17999.
+ * /v1/responses is routed by model slug: commancodex/* → 17999 (this bridge, official
+ * Command Code Provider API), everything else → 17841 (chatgpt-web).
  */
 
 const MUXER_PORT = 17850;
 
 const CHATGPT_WEB_BRIDGE = "http://127.0.0.1:17841";
-const BUFFCODEX_BRIDGE = "http://127.0.0.1:17999";
+const COMMANCEX_BRIDGE = "http://127.0.0.1:17999";
 
 type JsonObject = Record<string, unknown>;
 
-/** Freebuff catalog slugs are vendor-qualified (z-ai/, openai/, deepseek/, …). */
-function isFreebuffModel(slug: unknown): boolean {
-  return typeof slug === "string" && slug.includes("/") && !slug.startsWith("chatgpt-web/");
+function isCommancodexModel(slug: unknown): boolean {
+  return typeof slug === "string" && slug.startsWith("commancodex/");
 }
 
 function slugOf(model: unknown): string | undefined {
@@ -50,7 +49,7 @@ async function fetchJson(url: string, authorization?: string, timeoutMs = 8_000)
 
 function nativeTemplateCandidate(model: JsonObject): boolean {
   const modelSlug = slugOf(model);
-  if (!modelSlug || modelSlug.startsWith("chatgpt-web/")) return false;
+  if (!modelSlug || modelSlug.startsWith("chatgpt-web/") || modelSlug.startsWith("commancodex/")) return false;
   if (model.visibility !== "list") return false;
   if (!Array.isArray(model.supported_reasoning_levels)) return false;
   return true;
@@ -80,18 +79,19 @@ const FLASH_LADDER = ["low", "high", "max"];
 const STANDARD_LADDER = ["low", "medium", "high"];
 
 const THINKING_LADDERS: Array<{ match: RegExp; efforts: string[] }> = [
-  { match: /openai\/gpt-5\.6-luna/i, efforts: FULL_LADDER },
+  { match: /gpt-5\.6-luna/i, efforts: FULL_LADDER },
+  { match: /gpt-5\.3-codex/i, efforts: FULL_LADDER },
   { match: /glm-5\.3-flash/i, efforts: FLASH_LADDER },
-  { match: /deepseek-v4/i, efforts: FLASH_LADDER },
+  { match: /deepseek-v4-flash/i, efforts: FLASH_LADDER },
 ];
-const THINKING_FAMILY_PATTERN = /(glm|deepseek|kimi|qwen|minimax|gemini|claude)/i;
-const NON_THINKING_PATTERN = /(^|\/)(mimo\/|upstage\/solar-pro4)/i;
+const THINKING_FAMILY_PATTERN = /(glm|deepseek|kimi|qwen|minimax|gemini|claude|gpt-5|grok|fable|nemotron)/i;
+const NON_THINKING_PATTERN = /(^|\/)(mimo|solar)/i;
 
-function freebuffLadder(modelId: string): string[] {
-  const known = THINKING_LADDERS.find(entry => entry.match.test(modelId));
+function commancodexLadder(upstreamId: string): string[] {
+  const known = THINKING_LADDERS.find(entry => entry.match.test(upstreamId));
   if (known) return known.efforts;
-  if (NON_THINKING_PATTERN.test(modelId)) return ["none"];
-  if (THINKING_FAMILY_PATTERN.test(modelId)) return STANDARD_LADDER;
+  if (NON_THINKING_PATTERN.test(upstreamId)) return ["none"];
+  if (THINKING_FAMILY_PATTERN.test(upstreamId)) return STANDARD_LADDER;
   return ["none"];
 }
 
@@ -99,19 +99,20 @@ const DEFAULT_CONTEXT_WINDOW = 190_000;
 const AUTO_COMPACT_TOKEN_LIMIT = 170_000;
 
 /** Mirror of buildChatGptWebModel: structuredClone(template) + identity overrides. */
-function buildFreebuffModelRow(templateValue: JsonObject, modelId: string): JsonObject {
+function buildCommancodexModelRow(templateValue: JsonObject, slug: string): JsonObject {
   const template = structuredClone(templateValue);
-  const ladder = freebuffLadder(modelId);
-  const displayName = `Freebuff — ${modelId.split("/").pop() ?? modelId}`;
+  const upstreamId = slug.slice("commancodex/".length);
+  const ladder = commancodexLadder(upstreamId);
+  const displayName = `Commancodex — ${upstreamId.split("/").pop() ?? upstreamId}`;
   const thinking = !(ladder.length === 1 && ladder[0] === "none");
   const defaultLevel = thinking ? ladder[ladder.length - 1]! : "low";
   const model: JsonObject = {
     ...template,
-    slug: modelId,
+    slug,
     display_name: displayName,
     description: thinking
-      ? `${modelId} served free through the local Freebuff pool (thinking model).`
-      : `${modelId} served free through the local Freebuff pool.`,
+      ? `${upstreamId} via the official Command Code Provider API (thinking model).`
+      : `${upstreamId} via the official Command Code Provider API.`,
     input_modalities: ["text", "image"],
     visibility: "list",
     supported_in_api: true,
@@ -134,7 +135,7 @@ function buildFreebuffModelRow(templateValue: JsonObject, modelId: string): Json
 
 // ── Muxed catalog ─────────────────────────────────────────────────────────────
 
-const NATIVE_CACHE_PATH = `${process.env.HOME ?? ""}/.buffcodex/mux-native-catalog.json`;
+const NATIVE_CACHE_PATH = `${process.env.HOME ?? ""}/.commandcodex/mux-native-catalog.json`;
 
 function saveNativeCache(catalog: unknown): void {
   try {
@@ -151,13 +152,13 @@ function loadNativeCache(): unknown | null {
   }
 }
 
-function mergeCatalog(catalog: JsonObject, freebuffModels: string[]): unknown {
+function mergeCatalog(catalog: JsonObject, commancodexModels: string[]): unknown {
   const models = catalog.models as unknown[];
   const template = selectNativeTemplate(models);
   const existing = new Set(models.map(slugOf).filter(Boolean) as string[]);
-  const appended = freebuffModels
+  const appended = commancodexModels
     .filter(slug => !existing.has(slug))
-    .map(slug => buildFreebuffModelRow(template, slug));
+    .map(slug => buildCommancodexModelRow(template, slug));
   return { ...catalog, models: [...models, ...appended] };
 }
 
@@ -165,29 +166,26 @@ async function muxedCatalog(authorization?: string, search = ""): Promise<unknow
   // The passthrough requires Codex's client_version query param — forward the caller's
   // search string verbatim.
   const native = await fetchJson(`${CHATGPT_WEB_BRIDGE}/v1/models${search}`, authorization);
-  const buffcodex = await fetchJson(`${BUFFCODEX_BRIDGE}/v1/models`);
-  const freebuffModels = ((buffcodex as { models?: unknown[] } | null)?.models ?? [])
+  const ours = await fetchJson(`${COMMANCEX_BRIDGE}/v1/models`);
+  const commancodexModels = ((ours as { models?: unknown[] } | null)?.models ?? [])
     .map(row => slugOf(row))
-    .filter((slug): slug is string => typeof slug === "string");
+    .filter((slug): slug is string => typeof slug === "string" && slug.startsWith("commancodex/"));
 
   if (native && typeof native === "object" && Array.isArray((native as JsonObject).models)) {
-    // Primary path — identical to augmentNativeModelCatalog: pass the whole catalog
-    // through and append rows built from its own native template. Cache it: the caller's
-    // Bearer is refreshed by the app, but can be stale exactly when we need it.
     saveNativeCache(native);
-    return mergeCatalog(structuredClone(native) as JsonObject, freebuffModels);
+    return mergeCatalog(structuredClone(native) as JsonObject, commancodexModels);
   }
 
   // Native fetch failed (stale/expired Bearer or bridge down): use the last-good cache.
   const cached = loadNativeCache();
   if (cached && typeof cached === "object" && Array.isArray((cached as JsonObject).models)) {
-    return mergeCatalog(structuredClone(cached) as JsonObject, freebuffModels);
+    return mergeCatalog(structuredClone(cached) as JsonObject, commancodexModels);
   }
 
   // Last resort: embedded schema template (proven accepted by Codex 0.152).
   const { default: embeddedTemplate } = await import("./schema-template.json");
   return {
-    models: freebuffModels.map(slug => buildFreebuffModelRow(embeddedTemplate as JsonObject, slug)),
+    models: commancodexModels.map(slug => buildCommancodexModelRow(embeddedTemplate as JsonObject, slug)),
   };
 }
 
@@ -196,7 +194,7 @@ async function muxedCatalog(authorization?: string, search = ""): Promise<unknow
 /**
  * Codex sends zstd-compressed request bodies (content-encoding: zstd), so the raw bytes
  * must be decompressed before the JSON can be peeked at. Undecodable bodies route to the
- * chatgpt-web bridge (safe default — Freebuff turns are opt-in by model slug).
+ * chatgpt-web bridge (safe default — commancodex turns are opt-in by model slug).
  */
 function pickUpstream(body: Uint8Array | undefined, headers: Headers, path: string): string {
   if (path !== "/v1/responses" || body === undefined || body.byteLength === 0) return CHATGPT_WEB_BRIDGE;
@@ -210,7 +208,7 @@ function pickUpstream(body: Uint8Array | undefined, headers: Headers, path: stri
       jsonText = new TextDecoder().decode(body);
     }
     const parsed = JSON.parse(jsonText) as { model?: unknown };
-    return isFreebuffModel(parsed.model) ? BUFFCODEX_BRIDGE : CHATGPT_WEB_BRIDGE;
+    return isCommancodexModel(parsed.model) ? COMMANCEX_BRIDGE : CHATGPT_WEB_BRIDGE;
   } catch {
     return CHATGPT_WEB_BRIDGE;
   }
@@ -241,18 +239,18 @@ async function forward(
 }
 
 function muxerDashboard(port: number): string {
-  return `<!doctype html><html><head><meta charset="utf-8"><title>buffcodex muxer</title>
+  return `<!doctype html><html><head><meta charset="utf-8"><title>commandcodex muxer</title>
 <style>body{font-family:-apple-system,system-ui,sans-serif;background:#0d1117;color:#e6edf3;
 display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0}
 .card{max-width:560px;padding:32px;border:1px solid #30363d;border-radius:12px;background:#161b22}
 h1{margin:0 0 8px;font-size:20px}code{background:#21262d;padding:2px 6px;border-radius:4px;font-size:13px}
 ul{line-height:1.9;color:#8b949e}</style></head><body><div class="card">
-<h1>buffcodex model multiplexer</h1>
-<p>Codex points at <code>http://127.0.0.1:${port}/v1</code> — chatgpt-web <em>and</em> Freebuff models.</p>
+<h1>commandcodex model multiplexer</h1>
+<p>Codex points at <code>http://127.0.0.1:${port}/v1</code> — chatgpt-web <em>and</em> Commancodex models.</p>
 <ul>
 <li><code>127.0.0.1:17841</code> — chatgpt-web bridge (catalog passed through untouched)</li>
-<li><code>127.0.0.1:17999</code> — buffcodex Freebuff bridge</li>
-<li><code>127.0.0.1:${port}</code> — this muxer (native catalog + appended Freebuff rows)</li>
+<li><code>127.0.0.1:17999</code> — commancodex bridge (official Command Code Provider API)</li>
+<li><code>127.0.0.1:${port}</code> — this muxer (native catalog + appended commancodex rows)</li>
 </ul></div></body></html>`;
 }
 
@@ -283,5 +281,5 @@ const server = Bun.serve({
   },
 });
 
-console.info(`buffcodex muxer listening on http://127.0.0.1:${server.port}/v1`);
-console.info(`  appends Freebuff rows to the catalog of ${CHATGPT_WEB_BRIDGE}; turns route by model`);
+console.info(`commandcodex muxer listening on http://127.0.0.1:${server.port}/v1`);
+console.info(`  appends commancodex rows to the catalog of ${CHATGPT_WEB_BRIDGE}; turns route by model`);

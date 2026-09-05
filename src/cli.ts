@@ -1,14 +1,12 @@
 /**
- * Buffcodex CLI.
+ * Commandcodex CLI.
  *
- *   buffcodex serve                      Start the Responses bridge on 127.0.0.1:17999
- *   buffcodex accounts add <token>       Add a Freebuff account auth token
- *   buffcodex accounts list              Show configured accounts
- *   buffcodex accounts remove <n>        Remove account by its list index
- *   buffcodex models                     List models exposed to Codex
- *   buffcodex doctor                     Validate config, tokens, and upstream reachability
- *   buffcodex codex install              Point Codex at this bridge (reversible)
- *   buffcodex codex remove               Restore the previous Codex routing
+ *   commandcodex set <api-key>     Save + validate the Command Code Provider API key
+ *   commandcodex serve             Start the Responses bridge
+ *   commandcodex models            List models exposed to Codex
+ *   commandcodex doctor            Validate key, upstream reachability, Codex routing
+ *   commandcodex codex install     Point Codex at this bridge (reversible)
+ *   commandcodex codex remove      Restore the previous Codex routing
  */
 import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
@@ -21,134 +19,118 @@ import {
   loadConfig,
   saveConfig,
   maskToken,
-  type BuffcodexConfig,
+  type CommandCodexConfig,
 } from "./config";
-import { UpstreamClient } from "./freebuff/upstream";
-import { ModelRegistry } from "./freebuff/models";
-import { createRuntime, startServer } from "./server";
+import { CommancodexClient } from "./commancodex/client";
+import { createRuntime, startServer, refreshProviderModels } from "./server";
 
 const CODEX_HOME = process.env.CODEX_HOME?.trim() || join(homedir(), ".codex");
 const CODEX_CONFIG_PATH = join(CODEX_HOME, "config.toml");
 /** Codex's picker catalog cache — stale copies shadow the provider's /v1/models, so any
- *  install/uninstall must remove it (same as codex-chatgpt-web) to force a refetch. */
+ *  install/uninstall must remove it to force a refetch (same as codex-chatgpt-web). */
 const CODEX_MODELS_CACHE_PATH = join(CODEX_HOME, "models_cache.json");
-const ROUTE_MARKER = "# buffcodex-managed-route";
+const ROUTE_MARKER = "# commandcodex-managed-route";
+const LEGACY_ROUTE_MARKER = "# buffcodex-managed-route";
 
 function fail(message: string): never {
   console.error(`error: ${message}`);
   process.exit(1);
 }
 
-/** bcx_-prefixed, 192-bit random key for LAN exposure. */
+/** ccx_-prefixed, 192-bit random key for LAN exposure. */
 function generateApiKey(): string {
-  return `bcx_${randomBytes(24).toString("base64url")}`;
+  return `ccx_${randomBytes(24).toString("base64url")}`;
 }
 
-function ensureConfig(): BuffcodexConfig {
+function ensureConfig(requireKey = false): CommandCodexConfig {
   if (!existsSync(getConfigPath())) {
-    // Dashboard-first: an empty config is valid — the pool starts with zero accounts and
-    // the user adds tokens from the dashboard at http://127.0.0.1:17999/.
     const config = defaultConfig();
     saveConfig(config);
-    console.info(`created ${getConfigPath()} with no accounts — add one via:\n  buffcodex accounts add <auth-token>`);
+    console.info(`created ${getConfigPath()} — add your Provider API key with:\n  commandcodex set <api-key>`);
+    if (requireKey) fail("no Provider API key configured yet");
     return config;
   }
   try {
-    return loadConfig();
+    return loadConfig(requireKey);
   } catch (error) {
     fail(error instanceof Error ? error.message : String(error));
   }
 }
 
-async function cmdAccountsAdd(tokenArg: string | undefined): Promise<void> {
-  const token = tokenArg?.trim();
-  if (!token) fail("usage: buffcodex accounts add <auth-token>");
-  const config = existsSync(getConfigPath()) ? loadConfig() : defaultConfig();
-  if (config.authTokens.includes(token)) {
-    console.info("that token is already configured");
-    return;
-  }
-  console.info("validating token against the Freebuff backend…");
-  const probe = new UpstreamClient({ baseUrl: config.upstreamBaseUrl, requestTimeoutMs: 20_000 });
-  try {
-    const session = await probe.createOrRefreshSession(token);
-    console.info(`token ok (free session status: ${session.status})`);
-  } catch (error) {
-    fail(`token validation failed: ${error instanceof Error ? error.message : String(error)}`);
-  }
-  config.authTokens.push(token);
-  saveConfig(config);
-  console.info(`added account-${config.authTokens.length} (${maskToken(token)}) — ${config.authTokens.length} account(s) total`);
-}
-
-async function cmdAccountsList(): Promise<void> {
-  const config = ensureConfig();
-  if (config.authTokens.length === 0) {
-    console.info("no accounts configured — add one with: buffcodex accounts add <auth-token>");
-    return;
-  }
-  console.info(`configured accounts (${config.authTokens.length}):`);
-  config.authTokens.forEach((token, index) => {
-    console.info(`  ${index + 1}. account-${index + 1}  ${maskToken(token)}`);
+function clientFor(config: CommandCodexConfig, apiKey = config.apiKey): CommancodexClient {
+  return new CommancodexClient({
+    apiKey,
+    ...(config.providerBaseUrl ? { baseUrl: config.providerBaseUrl } : {}),
   });
 }
 
-async function cmdAccountsRemove(indexArg: string | undefined): Promise<void> {
-  const index = Number.parseInt(indexArg ?? "", 10);
-  if (!Number.isInteger(index) || index < 1) fail("usage: buffcodex accounts remove <index, 1-based>");
-  const config = ensureConfig();
-  if (index > config.authTokens.length) fail(`account-${index} does not exist (${config.authTokens.length} configured)`);
-  const [removed] = config.authTokens.splice(index - 1, 1);
-  if (config.authTokens.length === 0) fail("cannot remove the last account — buffcodex needs at least one token");
+async function cmdSet(keyArg: string | undefined): Promise<void> {
+  const apiKey = keyArg?.trim();
+  if (!apiKey) fail("usage: commandcodex set <api-key>  (create one at commandcode.ai → Studio → API keys)");
+  const config = existsSync(getConfigPath()) ? ensureConfig() : defaultConfig();
+  config.apiKey = apiKey;
   saveConfig(config);
-  console.info(`removed account-${index} (${maskToken(removed!)})`);
+  // Validate the key immediately so a typo never silently serves 401s.
+  try {
+    const models = await clientFor(config, apiKey).listModels();
+    console.info(`Provider API key saved (${maskToken(apiKey)}) — ${models.length} models reachable`);
+    console.info("run 'commandcodex serve' (or restart the LaunchAgent) to pick it up");
+  } catch (error) {
+    console.warn(`key saved, but validation failed: ${error instanceof Error ? error.message : String(error)}`);
+    console.warn(`double-check the key in ${getConfigPath()}`);
+  }
+}
+
+async function cmdRemoveKey(): Promise<void> {
+  const config = ensureConfig();
+  if (!config.apiKey) {
+    console.info("no Provider API key configured");
+    return;
+  }
+  config.apiKey = "";
+  saveConfig(config);
+  console.info("Provider API key removed");
 }
 
 async function cmdModels(): Promise<void> {
-  const registry = new ModelRegistry();
-  await registry.start();
-  const models = registry.models();
-  registry.stop();
-  if (models.length === 0) fail("no models available");
-  console.info(`models exposed to Codex (${models.length}):`);
-  for (const model of models) console.info(`  ${model}`);
+  const config = ensureConfig();
+  if (!config.apiKey) fail(`no Provider API key configured — run 'commandcodex set <api-key>'`);
+  const runtime = createRuntime(config);
+  if (runtime.providerRows.length === 0) fail("no models available — is the key valid? run 'commandcodex doctor'");
+  console.info(`models exposed to Codex (${runtime.providerRows.length}):`);
+  for (const row of runtime.providerRows) console.info(`  commancodex/${row.id}`);
 }
 
 async function cmdDoctor(): Promise<void> {
   const config = ensureConfig();
   console.info(`config: ${getConfigPath()} (version ${config.version})`);
-  console.info(`upstream: ${config.upstreamBaseUrl}`);
-  console.info(`accounts: ${config.authTokens.length}`);
-  const probe = new UpstreamClient({ baseUrl: config.upstreamBaseUrl, requestTimeoutMs: 20_000 });
-  for (const [index, token] of config.authTokens.entries()) {
+  console.info(`provider: ${config.providerBaseUrl ?? "https://api.commandcode.ai"}`);
+  console.info(`key: ${config.apiKey ? maskToken(config.apiKey) : "MISSING"}`);
+  if (config.apiKey) {
     try {
-      const session = await probe.createOrRefreshSession(token);
-      console.info(`  account-${index + 1}: ok (session ${session.status})`);
+      const models = await clientFor(config).listModels();
+      console.info(`  provider: ok (${models.length} models)`);
     } catch (error) {
-      console.info(`  account-${index + 1}: FAILED — ${error instanceof Error ? error.message : String(error)}`);
+      console.info(`  provider: FAILED — ${error instanceof Error ? error.message : String(error)}`);
     }
   }
-  const registry = new ModelRegistry();
-  await registry.start();
-  console.info(`models: ${registry.models().length} available`);
-  registry.stop();
   console.info(`codex config: ${CODEX_CONFIG_PATH}`);
   if (existsSync(CODEX_CONFIG_PATH)) {
     const text = readFileSync(CODEX_CONFIG_PATH, "utf8");
-    console.info(`  bridge route: ${text.includes(ROUTE_MARKER) ? "installed" : "not installed"}`);
+    const managed = text.includes(ROUTE_MARKER) || text.includes(LEGACY_ROUTE_MARKER);
+    console.info(`  bridge route: ${managed ? "installed" : "not installed"}`);
   } else {
-    console.info("  Codex config.toml not found — run 'codex' once to create it, then 'buffcodex codex install'");
+    console.info("  Codex config.toml not found — run 'codex' once, then 'commandcodex codex install'");
   }
 }
 
-/** Codex's default model after install — the strongest free thinking model. */
-const DEFAULT_CODEX_MODEL = "z-ai/glm-5.3-flash";
+/** Codex's default model after install — the strongest open thinking model on the API. */
+const DEFAULT_CODEX_MODEL = "commancodex/gpt-5.3-codex";
 
-/** The muxer merges the ChatGPT-app's native catalog with the Freebuff rows. The app only
- *  renders rows that carry the native schema (muxer builds those from its own template);
- *  raw 17999 rows are fine for the plain Codex CLI but invisible in the app's picker.
- *  Always pinned: the muxer upstream-forwards to the bridge, so if the bridge is down
- *  turns fail either way — a fallback route would just re-break the catalog silently. */
+/** The muxer merges the ChatGPT-app's native catalog with the commancodex rows. The app
+ *  only renders rows that carry the native schema (muxer builds those from its own
+ *  template). Always pinned: the muxer upstream-forwards to this bridge, so a fallback
+ *  route would just re-break the catalog silently. */
 const MUXER_URL = "http://127.0.0.1:17850";
 
 function routeUrl(): string {
@@ -156,16 +138,16 @@ function routeUrl(): string {
 }
 
 async function cmdCodexInstall(): Promise<void> {
-  const config = ensureConfig();
+  ensureConfig();
   const route = routeUrl();
   let text = existsSync(CODEX_CONFIG_PATH) ? readFileSync(CODEX_CONFIG_PATH, "utf8") : "";
-  const backupPath = `${CODEX_CONFIG_PATH}.buffcodex-backup`;
+  const backupPath = `${CODEX_CONFIG_PATH}.commandcodex-backup`;
   if (!existsSync(backupPath)) writeFileSync(backupPath, text, { mode: 0o600 });
 
   // Mirror codex-chatgpt-web's managed route exactly: ONLY openai_base_url. Installing a
   // custom model_provider + provider table renames the app's provider (bottom-left shows
-  // "buffcodex") and breaks the normal-chat mode switch — with just the base URL the app
-  // keeps its built-in provider identity and every mode works.
+  // the custom name) and breaks the normal-chat mode switch — with just the base URL the
+  // app keeps its built-in provider identity and every mode works.
   const managedLines = [
     ROUTE_MARKER,
     `openai_base_url = "${route}"`,
@@ -173,23 +155,26 @@ async function cmdCodexInstall(): Promise<void> {
 
   const lines = text.split("\n");
   // 1) Strip the previous managed region: from the marker to the next table header.
-  const markerIndex = lines.findIndex(line => line.trim() === ROUTE_MARKER);
+  const markerIndex = lines.findIndex(line => {
+    const trimmed = line.trim();
+    return trimmed === ROUTE_MARKER || trimmed === LEGACY_ROUTE_MARKER;
+  });
   if (markerIndex !== -1) {
     let end = markerIndex + 1;
     while (end < lines.length && !lines[end]!.trim().startsWith("[")) end++;
     lines.splice(markerIndex, end - markerIndex);
   }
-  // 1b) Remove the legacy provider table from older installs: it renamed the app's
-  //     provider ("buffcodex" bottom-left) and broke the normal-chat mode switch.
-  const legacyTable = lines.findIndex(line => line.trim() === "[model_providers.buffcodex]");
+  // 1b) Remove the legacy provider table from older installs (buffcodex era).
+  const legacyTable = lines.findIndex(line => /^\[model_providers\.(buffcodex|commandcodex)\]/.test(line.trim()));
   if (legacyTable !== -1) {
     let end = legacyTable + 1;
     while (end < lines.length && !lines[end]!.trim().startsWith("[")) end++;
     lines.splice(legacyTable, end - legacyTable);
   }
-  // 2) Ensure a valid default `model` exists. A top-level `model = "chatgpt-web/…"` is stale
-  //    (that provider no longer exists) and gets replaced; a missing model gets the default;
-  //    a user-chosen Freebuff model is left alone. The chatgpt-web-era effort pin goes with it.
+
+  // 2) Ensure a valid default `model` exists. A stale chatgpt-web/ or removed-provider
+  //    model is replaced; a missing model gets the default; a user-chosen commancodex
+  //    model is left alone. Any global effort pin goes with it (hides the picker).
   let insideTable = false;
   let topModel: string | undefined;
   for (const line of lines) {
@@ -197,15 +182,15 @@ async function cmdCodexInstall(): Promise<void> {
     if (trimmed.startsWith("[")) { insideTable = true; continue; }
     if (!insideTable && /^model\s*=/.test(trimmed)) { topModel = trimmed; break; }
   }
-  const staleModel = topModel !== undefined && topModel.includes("chatgpt-web/");
+  const staleModel = topModel !== undefined
+    && (topModel.includes("chatgpt-web/") || topModel.includes("buffcodex/") || topModel.includes("commandcode/"));
   const needsDefaultModel = topModel === undefined || staleModel;
   for (let i = lines.length - 1; i >= 0; i--) {
     const trimmed = lines[i]!.trim();
     if (trimmed.startsWith("[")) { insideTable = false; continue; }
     if (!insideTable && /^(openai_base_url|model_provider)\s*=/.test(trimmed)) lines.splice(i, 1);
     if (!insideTable && needsDefaultModel && /^model\s*=/.test(trimmed)) lines.splice(i, 1);
-    // A global effort pin hides the app's per-model intensity picker — never keep one,
-    // ours or the user's ('codex remove' restores the backup if it was wanted).
+    // A global effort pin hides the app's per-model intensity picker — never keep one.
     if (!insideTable && /^model_reasoning_effort\s*=/.test(trimmed)) lines.splice(i, 1);
   }
   if (needsDefaultModel) {
@@ -221,69 +206,62 @@ async function cmdCodexInstall(): Promise<void> {
   rmSync(CODEX_MODELS_CACHE_PATH, { force: true });
 
   console.info(`Codex now routes through ${route}`);
-  if (config.host === "0.0.0.0") {
-    console.info("local Codex needs no key (loopback is trusted); remote Codex sends the bcx_ key from config.json via x-api-key or BUFFCODEX_API_KEY");
+  if (existsSync(getConfigPath())) {
+    const parsed = loadConfig().host;
+    if (parsed === "0.0.0.0") {
+      console.info("local Codex needs no key (loopback is trusted); remote Codex sends the ccx_ key from config.json via x-api-key or COMMANDCODEX_API_KEY");
+    }
   }
   console.info(`\nprevious config saved at ${backupPath}`);
-  console.info("restart Codex, then pick any 'Freebuff — …' model in the picker");
+  console.info("restart Codex, then pick any 'Commancodex — …' model in the picker");
 }
 
 async function cmdCodexRemove(): Promise<void> {
-  const backupPath = `${CODEX_CONFIG_PATH}.buffcodex-backup`;
-  if (!existsSync(backupPath)) fail("no backup found — nothing to restore");
-  const backup = readFileSync(backupPath, "utf8");
+  const backupPath = `${CODEX_CONFIG_PATH}.commandcodex-backup`;
+  const legacyBackupPath = `${CODEX_CONFIG_PATH}.buffcodex-backup`;
+  const restoreFrom = existsSync(backupPath) ? backupPath : existsSync(legacyBackupPath) ? legacyBackupPath : undefined;
+  if (!restoreFrom) fail("no backup found — nothing to restore");
+  const backup = readFileSync(restoreFrom, "utf8");
   writeFileSync(CODEX_CONFIG_PATH, backup, { mode: 0o600 });
-  rmSync(backupPath);
+  rmSync(restoreFrom);
   rmSync(CODEX_MODELS_CACHE_PATH, { force: true });
   console.info("Codex routing restored from backup");
 }
 
 async function cmdServe(): Promise<void> {
-  const config = ensureConfig();
-  // LAN-wide binding without a key would hand your accounts to the whole network.
+  const config = ensureConfig(true);
+  // LAN-wide binding without a key would hand your Provider API key to the whole network.
   const secured = config.host === "0.0.0.0" && config.apiKeys.length === 0
     ? (() => {
         const apiKey = generateApiKey();
         saveConfig({ ...config, apiKeys: [apiKey] });
-        console.info(`host is 0.0.0.0 — generated an API key (saved to config.json):\n  BUFFCODEX_API_KEY=${apiKey}`);
+        console.info(`host is 0.0.0.0 — generated a proxy API key (saved to config.json):\n  COMMANDCODEX_API_KEY=${apiKey}`);
         return { ...config, apiKeys: [apiKey] };
       })()
     : config;
   const runtime = createRuntime(secured);
-  // Live account changes (dashboard/panel) persist straight back to config.json.
-  runtime.onAccountsChanged = () => {
-    try {
-      saveConfig({ ...runtime.config, authTokens: runtime.pool.listAccounts().map(account => account.revealToken()) });
-    } catch (error) {
-      console.warn(`failed to persist account change: ${error instanceof Error ? error.message : String(error)}`);
-    }
-  };
-  await runtime.registry.start();
   const server = startServer(runtime);
 
-  const maintain = setInterval(() => {
-    void runtime.pool.maintainAll();
-  }, 60_000);
-  maintain.unref?.();
+  const count = await refreshProviderModels(runtime);
+  console.info(`provider catalog: ${count} model(s) via the official Command Code Provider API`);
+
+  const ccRefresh = setInterval(() => void refreshProviderModels(runtime), 10 * 60_000);
+  ccRefresh.unref?.();
 
   const shutdown = async () => {
-    clearInterval(maintain);
+    clearInterval(ccRefresh);
     console.info("\nshutting down…");
-    try {
-      await runtime.pool.shutdown();
-    } catch { /* best effort */ }
-    runtime.registry.stop();
     server.stop();
     process.exit(0);
   };
   process.on("SIGINT", () => void shutdown());
   process.on("SIGTERM", () => void shutdown());
-  const dashboards = listenHosts(secured.host, secured.port);
-  console.info(`serving ${secured.authTokens.length} account(s) — usage API: ${dashboards[0]} — press Ctrl+C to stop`);
-  if (dashboards.length > 1) console.info(`also reachable at: ${dashboards.slice(1).join(", ")}`);
+  const urls = listenHosts(secured.host, secured.port);
+  console.info(`serving on ${urls[0]} — press Ctrl+C to stop`);
+  if (urls.length > 1) console.info(`also reachable at: ${urls.slice(1).join(", ")}`);
 }
 
-/** All usable dashboard URLs for the bound host (incl. LAN IPs when binding broadly). */
+/** All usable bridge URLs for the bound host (incl. LAN IPs when binding broadly). */
 function listenHosts(host: string, port: number): string[] {
   if (host !== "0.0.0.0" && host !== "::") return [`http://${host}:${port}/`];
   const urls: string[] = [];
@@ -296,62 +274,52 @@ function listenHosts(host: string, port: number): string[] {
 }
 
 function printHelp(): void {
-  console.info(`buffcodex ${VERSION} — run Codex on every free Freebuff model
+  console.info(`commandcodex ${VERSION} — run Codex on every Command Code model (official Provider API)
 
 USAGE
-  buffcodex <command> [args]
+  commandcodex <command> [args]
 
 COMMANDS
+  set <api-key>              Save + validate the Command Code Provider API key
+                             (commandcode.ai → Studio → API keys).
+  remove-key                 Remove the stored Provider API key.
   serve                      Start the Responses bridge (default port 17999).
-                             Dashboard: http://127.0.0.1:17999/ — add accounts, watch
-                             per-account usage, live notifications. With host 0.0.0.0 in
-                             config, an API key is generated automatically.
-  accounts add <token>       Validate and add a Freebuff account auth token
-                             (the __Secure-next-auth.session-token cookie from freebuff.com).
-  accounts list              List configured accounts (tokens masked).
-  accounts remove <n>        Remove account n (1-based index from 'accounts list').
-  models                     List the models exposed to Codex (live registry).
-  doctor                     Validate config, tokens, and upstream reachability.
+  models                     List the models exposed to Codex (live provider catalog).
+  doctor                     Validate key, provider reachability, and Codex routing.
   codex install              Route Codex through this bridge (writes ~/.codex/config.toml,
-                             backs up the original; prints the API-key env var if one is set).
+                             backs up the original).
   codex remove               Restore the previous Codex routing from the backup.
   help                       Show this help.
   version                    Print the version.
 
 TYPICAL FLOW
-  buffcodex accounts add <token>       # repeat for each account
-  buffcodex serve                      # leave running; dashboard on :17999
-  buffcodex codex install              # in another terminal; then restart Codex
+  commandcodex set <api-key>           # commandcode.ai → Studio → API keys
+  commandcodex serve                   # leave running
+  commandcodex codex install           # in another terminal; then restart Codex
 
 LAN ACCESS
-  Set "host": "0.0.0.0" in ~/.buffcodex/config.json to serve your whole network.
-  An API key (bcx_…) is generated on first serve; Codex and remote clients must send it
-  via the BUFFCODEX_API_KEY environment variable or an x-api-key header.
+  Set "host": "0.0.0.0" in ~/.commandcodex/config.json to serve your whole network.
+  A proxy API key (ccx_…) is generated on first serve; remote clients must send it
+  via the COMMANDCODEX_API_KEY environment variable or an x-api-key header.
 
 ENVIRONMENT
-  BUFFCODEX_HOME             Data directory override (default ~/.buffcodex)
-  BUFFCODEX_API_KEY          API key Codex sends when keys are configured`);
+  COMMANDCODEX_HOME          Data directory override (default ~/.commandcodex)
+  COMMANDCODEX_API_KEY       Proxy API key remote Codex sends when keys are configured`);
 }
 
 async function main(): Promise<void> {
   const [command, ...args] = process.argv.slice(2);
   switch (command) {
     case "serve": return cmdServe();
-    case "accounts":
-      switch (args[0]) {
-        case "add": return cmdAccountsAdd(args[1]);
-        case "list": return cmdAccountsList();
-        case "remove": return cmdAccountsRemove(args[1]);
-        default: fail("usage: buffcodex accounts <add|list|remove> [args]");
-      }
-      return;
+    case "set": return cmdSet(args[0]);
+    case "remove-key": return cmdRemoveKey();
     case "models": return cmdModels();
     case "doctor": return cmdDoctor();
     case "codex":
       switch (args[0]) {
         case "install": return cmdCodexInstall();
         case "remove": return cmdCodexRemove();
-        default: fail("usage: buffcodex codex <install|remove>");
+        default: fail("usage: commandcodex codex <install|remove>");
       }
       return;
     case "help":
@@ -362,7 +330,7 @@ async function main(): Promise<void> {
     case "version":
     case "--version":
     case "-v":
-      console.info(`buffcodex ${VERSION}`);
+      console.info(`commandcodex ${VERSION}`);
       return;
     default:
       if (command === undefined) {

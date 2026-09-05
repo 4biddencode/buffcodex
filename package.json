@@ -1,16 +1,16 @@
 {
-  "name": "buffcodex",
-  "version": "0.1.0",
+  "name": "commandcodex",
+  "version": "1.0.0",
   "private": true,
-  "description": "A local Responses bridge that runs Codex tasks on all free Freebuff models with multi-account pooling.",
+  "description": "A local Responses bridge that runs Codex on every Command Code model via the official Provider API.",
   "packageManager": "bun@1.4.0",
   "type": "module",
   "bin": {
-    "buffcodex": "./src/cli.ts"
+    "commandcodex": "./src/cli.ts"
   },
   "scripts": {
     "start": "bun run src/cli.ts serve",
-    "accounts": "bun run src/cli.ts accounts",
+    
     "models": "bun run src/cli.ts models",
     "doctor": "bun run src/cli.ts doctor",
     "test": "bun test tests/*.test.ts",

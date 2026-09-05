@@ -1,29 +1,29 @@
 #!/usr/bin/env bash
-# buffcodex one-shot macOS installer.
+# commandcodex one-shot macOS installer.
 #
 #   tools/install-mac.sh
 #
 # Does everything:
-#   1. Verifies Bun 1.4+ (the runtime the freebuff CLI uses)
-#   2. bun install + compiles the buffcodex bridge AND the catalog muxer
-#   3. Installs both binaries on PATH (`buffcodex`, `buffcodex-mux`)
+#   1. Verifies Bun 1.4+
+#   2. bun install + compiles the commandcodex bridge AND the catalog muxer
+#   3. Installs both binaries on PATH (`commandcodex`, `commandcodex-mux`)
 #   4. Installs + (re)starts both LaunchAgents (bridge :17999, muxer :17850)
-#   5. Points Codex at the muxer — `buffcodex codex install` (reversible)
+#   5. Points Codex at the muxer — `commandcodex codex install` (reversible)
 #   6. Restarts the Codex/ChatGPT app so the merged catalog is live
 #
 # Safe to re-run at any time (updates, config changes): every step is idempotent
-# and your ~/.buffcodex/config.json (accounts!) is never touched.
+# and your ~/.commandcodex/config.json (API key!) is never touched.
 
 set -euo pipefail
 
 # Resolve the checkout (script lives in <checkout>/tools).
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BIN_NAME="buffcodex"
-MUX_NAME="buffcodex-mux"
+BIN_NAME="commandcodex"
+MUX_NAME="commandcodex-mux"
 INSTALL_DIR="/usr/local/bin"
 FALLBACK_INSTALL_DIR="$HOME/bin"
-LABEL="dev.buffcodex.serve"
-MUX_LABEL="dev.buffcodex.mux"
+LABEL="dev.commandcodex.serve"
+MUX_LABEL="dev.commandcodex.mux"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 MUX_PLIST="$HOME/Library/LaunchAgents/$MUX_LABEL.plist"
 BRIDGE_URL="http://127.0.0.1:17999"
@@ -63,7 +63,7 @@ fi
 BUN_VERSION="$(bun --version)"
 case "$BUN_VERSION" in
   1.[4-9]*|1.[1-9][0-9]*|2.*) ;;                     # 1.4+ is fine
-  *) warn "bun $BUN_VERSION found, but 1.4+ is recommended (freebuff CLI parity)"; ;;
+  *) warn "bun $BUN_VERSION found, but 1.4+ is recommended"; ;;
 esac
 echo "bun $BUN_VERSION"
 
@@ -90,8 +90,8 @@ install_to() {
       *":$FALLBACK_INSTALL_DIR:"*) ;;
       *)
         for rc in "$HOME/.zshrc" "$HOME/.zprofile"; do
-          if [[ -f "$rc" ]] && ! grep -qs 'bin buffcodex' "$rc"; then
-            printf '\n# buffcodex (added by installer)\nexport PATH="$HOME/bin:$PATH"\n' >> "$rc"
+          if [[ -f "$rc" ]] && ! grep -qs 'bin commandcodex' "$rc"; then
+            printf '\n# commandcodex (added by installer)\nexport PATH="$HOME/bin:$PATH"\n' >> "$rc"
           fi
         done
         warn "added $FALLBACK_INSTALL_DIR to PATH in ~/.zshrc / ~/.zprofile — open a new shell for it to apply"
@@ -105,6 +105,8 @@ install_to() {
 }
 BRIDGE_INSTALLED="$(install_to "$BRIDGE_BIN" "$BIN_NAME")"
 MUXER_INSTALLED="$(install_to "$MUXER_BIN" "$MUX_NAME")"
+# Remove stale binaries from the buffcodex era so the old names stop working.
+rm -f "$INSTALL_DIR/buffcodex" "$INSTALL_DIR/buffcodex-mux" "$FALLBACK_INSTALL_DIR/buffcodex" "$FALLBACK_INSTALL_DIR/buffcodex-mux" 2>/dev/null || true
 
 # ---------------------------------------------------------------- 4. LaunchAgents
 install_agent() {
@@ -123,8 +125,8 @@ install_agent() {
   </array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>$HOME/Library/Logs/buffcodex.log</string>
-  <key>StandardErrorPath</key><string>$HOME/Library/Logs/buffcodex.log</string>
+  <key>StandardOutPath</key><string>$HOME/Library/Logs/commandcodex.log</string>
+  <key>StandardErrorPath</key><string>$HOME/Library/Logs/commandcodex.log</string>
 </dict>
 </plist>
 EOF
@@ -135,24 +137,35 @@ EOF
 log "installing LaunchAgents ($LABEL, $MUX_LABEL)"
 install_agent "$LABEL" "$PLIST" "$BRIDGE_INSTALLED"
 install_agent "$MUX_LABEL" "$MUX_PLIST" "$MUXER_INSTALLED"
+# Unload the old buffcodex agents if they still exist.
+for old in dev.buffcodex.serve dev.buffcodex.mux; do
+  launchctl bootout "gui/$(id -u)/$old" 2>/dev/null || true
+  rm -f "$HOME/Library/LaunchAgents/$old.plist" 2>/dev/null || true
+done
 
 # ---------------------------------------------------------------- 5. codex routing
-CONFIG_DIR="${BUFFCODEX_HOME:-$HOME/.buffcodex}"
-TOKENS="$(/usr/bin/python3 - "$CONFIG_DIR/config.json" <<'PY' 2>/dev/null || echo ""
+CONFIG_DIR="${COMMANDCODEX_HOME:-$HOME/.commandcodex}"
+KEY_SET="$(/usr/bin/python3 - "$CONFIG_DIR/config.json" <<'PY' 2>/dev/null || echo ""
 import json, sys
 try:
     cfg = json.load(open(sys.argv[1]))
-    print(len([t for t in cfg.get("authTokens", []) if t]))
+    key = cfg.get("apiKey", "")
+    # Pre-rename spellings also count.
+    if not key and isinstance(cfg.get("commancodex"), dict):
+        key = cfg["commancodex"].get("apiKey", "")
+    if not key and isinstance(cfg.get("commandCode"), dict):
+        key = cfg["commandCode"].get("apiKey", "")
+    print(1 if key else 0)
 except Exception:
     print(0)
 PY
 )"
-if [[ "${TOKENS:-0}" -ge 1 ]]; then
+if [[ "${KEY_SET:-0}" -eq 1 ]]; then
   log "routing Codex through the bridge"
   "$BRIDGE_INSTALLED" codex install
 else
-  warn "no accounts configured yet — add one, then re-run this script:"
-  warn "  $BRIDGE_INSTALLED accounts add <freebuff-auth-token>"
+  warn "no Provider API key configured yet — set one, then re-run this script:"
+  warn "  $BRIDGE_INSTALLED set <commandcode-ai-api-key>"
 fi
 
 # ---------------------------------------------------------------- 6. restart the app
@@ -174,14 +187,11 @@ for _ in $(seq 1 20); do
   sleep 0.5
 done
 if ! curl -fsS "$BRIDGE_URL/healthz" >/dev/null 2>&1; then
-  warn "bridge did not come up — check ~/Library/Logs/buffcodex.log"
+  warn "bridge did not come up — check ~/Library/Logs/commandcodex.log"
   exit 1
 fi
 MODELS="$(curl -fsS "$MUXER_URL/v1/models" 2>/dev/null | /usr/bin/python3 -c 'import json,sys; print(len(json.load(sys.stdin)["models"]))' 2>/dev/null || echo "?")"
-ACCOUNTS="$(curl -fsS "$BRIDGE_URL/usage" 2>/dev/null | /usr/bin/python3 -c 'import json,sys; print(len(json.load(sys.stdin)["accounts"]))' 2>/dev/null || echo "?")"
 echo
-echo "✅ buffcodex is running"
-echo "   muxer:     $MUXER_URL/v1 — $MODELS models (native + Freebuff)"
+echo "✅ commandcodex is running"
+echo "   muxer:     $MUXER_URL/v1 — $MODELS models (native + Commancodex)"
 echo "   bridge:    $BRIDGE_URL/v1"
-echo "   accounts:  $ACCOUNTS active"
-[[ "${TOKENS:-0}" -ge 1 ]] || echo "   next:      add an account (see warning above), then restart Codex/ChatGPT"

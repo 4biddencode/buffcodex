@@ -1,68 +1,58 @@
 /**
- * Buffcodex HTTP server — the Codex-facing Responses bridge.
+ * Commandcodex HTTP server — the Codex-facing Responses bridge over the OFFICIAL
+ * Command Code Provider API (key-authenticated; no account pool, no bans).
  * Routes:
- *   GET  /v1/models                  → Codex model catalog (all free Freebuff models)
- *   POST /v1/responses               → Responses (streaming SSE or JSON) via the Freebuff pool
- *   GET  /healthz                    → liveness + account snapshots
- *   GET  /usage                      → per-account remaining/used usage (launcher panel)
- *   POST /accounts/validate          → validate an auth token without saving it
+ *   GET  /v1/models        → Codex model catalog (commancodex/* rows)
+ *   POST /v1/responses     → Responses (streaming SSE or JSON) via the Provider API
+ *   GET  /healthz          → liveness + model count
+ *   POST /key/validate     → validate a Provider API key without saving it
  */
 import { createHash } from "node:crypto";
 import type { AdapterEvent, CodexParsedRequest } from "./types";
 import type { ProviderAdapter } from "./adapters/base";
-import { createFreebuffAdapter } from "./adapters/freebuff";
+import { createCommancodexAdapter } from "./commancodex";
+import { CommancodexClient } from "./commancodex/client";
+import { errorText } from "./lib/errors";
 import { buildResponseJSON, bridgeToResponsesSSE } from "./bridge";
-import type { BuffcodexConfig } from "./config";
-import { maskToken } from "./config";
+import type { CommandCodexConfig } from "./config";
 import { expandPreviousResponseInput, rememberResponseState } from "./responses/state";
 import { parseRequest } from "./responses/parser";
-import { UpstreamClient } from "./freebuff/upstream";
-import { AccountPool, FreebuffAccount, errorText } from "./freebuff/pool";
-import { ModelRegistry, PREMIUM_SESSION_LIMIT } from "./freebuff/models";
-import { buildFreebuffModelCatalog } from "./models-catalog";
+import {
+  buildCommancodexModelCatalog,
+  buildCommancodexModel,
+  FALLBACK_PROVIDER_MODELS,
+} from "./models-catalog";
 import { COMPACT_PROMPT } from "./responses/compaction";
 import { readJsonRequestBody } from "./http-body";
 import { namespacedToolName } from "./types";
 
 export interface Runtime {
-  config: BuffcodexConfig;
-  client: UpstreamClient;
-  pool: AccountPool;
-  registry: ModelRegistry;
+  config: CommandCodexConfig;
+  client: CommancodexClient;
   adapter: ProviderAdapter;
+  /** Live provider rows (id, name, context_length); empty = fallback rows. */
+  providerRows: Array<{ id: string; name?: string; context_length?: number }>;
   startedAt: number;
-  /** Invoked after a live account add/remove so the CLI can persist config. */
-  onAccountsChanged?: () => void;
-  /** Incremental /usage notifications: dashboard polls only receive the new slice. */
-  usageRequestState: { lastPollMs: number };
 }
 
-export function createRuntime(config: BuffcodexConfig): Runtime {
-  // Tier parsing shares the registry's source files; the registry consumes tiers on refresh.
-  const client = new UpstreamClient({
-    baseUrl: config.upstreamBaseUrl,
+export function createRuntime(config: CommandCodexConfig): Runtime {
+  const client = new CommancodexClient({
+    apiKey: config.apiKey,
+    ...(config.providerBaseUrl ? { baseUrl: config.providerBaseUrl } : {}),
     requestTimeoutMs: config.requestTimeoutMs,
     ...(config.httpProxy ? { httpProxy: config.httpProxy } : {}),
   });
-  const accounts = config.authTokens.map((token, index) => new FreebuffAccount({
-    name: `account-${index + 1}`,
-    token,
-    maskedToken: maskToken(token),
+  const adapter = createCommancodexAdapter({
     client,
-    rotationIntervalMs: config.rotationIntervalMs,
-    requestTimeoutMs: config.requestTimeoutMs,
-  }));
-  const pool = new AccountPool(accounts);
-  // Banned-account removal mutates the pool directly — persist it like live add/remove.
-  pool.onAccountsChanged = () => runtime.onAccountsChanged?.();
-  const registry = new ModelRegistry();
-  const adapter = createFreebuffAdapter({
-    pool,
-    resolveAgentId: modelId => registry.agentForModel(modelId) ?? "base2-free",
-    resolveModelTier: modelId => registry.tierFor(modelId),
+    resolveUpstreamModel: modelId => modelId.startsWith("commancodex/") ? modelId.slice("commancodex/".length) : modelId,
   });
-  const runtime: Runtime = { config, client, pool, registry, adapter, startedAt: Date.now(), usageRequestState: { lastPollMs: Date.now() } };
-  return runtime;
+  return {
+    config,
+    client,
+    adapter,
+    providerRows: [],
+    startedAt: Date.now(),
+  };
 }
 
 function json(body: unknown, status = 200, headers: Record<string, string> = {}): Response {
@@ -76,7 +66,7 @@ function errorResponse(status: number, message: string, type = "invalid_request_
   return json({ error: { message, type, code: type } }, status);
 }
 
-function authorized(request: Request, config: BuffcodexConfig): boolean {
+function authorized(request: Request, config: CommandCodexConfig): boolean {
   if (config.apiKeys.length === 0) return true;
   const header = request.headers.get("authorization") ?? "";
   const bearer = header.startsWith("Bearer ") ? header.slice(7).trim() : "";
@@ -84,18 +74,15 @@ function authorized(request: Request, config: BuffcodexConfig): boolean {
   return apiKey.length > 0 && config.apiKeys.includes(apiKey);
 }
 
-/** Loopback clients (local Codex, local dashboard) are always trusted — no API key. */
+/** Loopback clients (local Codex) are always trusted — no API key. */
 export function isLoopbackAddress(remoteAddress?: string | null): boolean {
   if (!remoteAddress) return false;
   return remoteAddress === "127.0.0.1" || remoteAddress === "::1" || remoteAddress === "::ffff:127.0.0.1";
 }
 
 /**
- * API keys gate non-loopback clients that would spend accounts or mutate configuration
- * (POSTs, Codex-facing /v1/*). Read-only GETs stay open for LAN dashboards; nothing
- * sensitive is in them — tokens are always masked in /usage. Loopback never needs a key,
- * so locally-installed Codex works without environment setup (GUI apps cannot read
- * shell rc files, so env-key auth is not viable for them).
+ * API keys gate non-loopback clients. Read-only GETs stay open for LAN dashboards;
+ * loopback never needs a key, so locally-installed Codex works without env setup.
  */
 function requiresApiKey(request: Request, runtime: Runtime, remoteAddress?: string | null): boolean {
   if (isLoopbackAddress(remoteAddress)) return false;
@@ -120,8 +107,18 @@ function toolBridgeMaps(parsed: CodexParsedRequest): {
   return { toolNsMap, freeformToolNames, toolSearchToolNames };
 }
 
+/** Codex rows from live provider data, else the static fallback. */
+function providerModels(runtime: Runtime): string[] {
+  return runtime.providerRows.length > 0
+    ? runtime.providerRows.map(row => row.id)
+    : FALLBACK_PROVIDER_MODELS;
+}
+
 async function handleModels(runtime: Runtime): Promise<Response> {
-  const catalog = buildFreebuffModelCatalog(registryModels(runtime), runtime.config.contextWindow);
+  const rows = runtime.providerRows.length > 0
+    ? runtime.providerRows.map(row => buildCommancodexModel(row.id, { contextLength: row.context_length, ...(row.name ? { display_name: row.name } : {}) }))
+    : FALLBACK_PROVIDER_MODELS.map(id => buildCommancodexModel(id, undefined, runtime.config.contextWindow));
+  const catalog = { models: rows };
   const body = JSON.stringify(catalog);
   return new Response(body, {
     status: 200,
@@ -130,11 +127,6 @@ async function handleModels(runtime: Runtime): Promise<Response> {
       "etag": `W/\"${createHash("sha256").update(body).digest("base64url")}\"`,
     },
   });
-}
-
-function registryModels(runtime: Runtime): string[] {
-  const models = runtime.registry.models();
-  return models.length > 0 ? models : ["minimax/minimax-m2.7", "z-ai/glm-5.1"];
 }
 
 async function handleResponses(request: Request, runtime: Runtime): Promise<Response> {
@@ -151,7 +143,7 @@ async function handleResponses(request: Request, runtime: Runtime): Promise<Resp
   } catch (error) {
     return errorResponse(400, error instanceof Error ? error.message : String(error));
   }
-  if (!runtime.registry.hasModel(parsed.modelId)) {
+  if (!supportsModel(runtime, parsed.modelId)) {
     return errorResponse(400, `unsupported model ${JSON.stringify(parsed.modelId)}`);
   }
   if (parsed._compactionRequest) {
@@ -264,112 +256,47 @@ export class EventQueue<T> {
   }
 }
 
-function accountSnapshots(runtime: Runtime) {
-  return runtime.pool.snapshots().map(snapshot => ({
-    name: snapshot.name,
-    maskedToken: snapshot.maskedToken,
-    status: snapshot.coolingDownUntilMs > Date.now()
-      ? "cooldown"
-      : snapshot.session?.status === "queued"
-        ? "queued"
-        : snapshot.lastError
-          ? "error"
-          : "ok",
-    lastError: snapshot.lastError || undefined,
-    session: snapshot.session ? { status: snapshot.session.status, position: snapshot.session.position, queueDepth: snapshot.session.queueDepth, expiresAtMs: snapshot.session.expiresAtMs } : undefined,
-    runs: snapshot.runs.map(run => ({ agentId: run.agentId, inflight: run.inflight, requestCount: run.requestCount })),
-    usage: {
-      requestCount: snapshot.usage.requestCount,
-      inputTokens: snapshot.usage.inputTokens,
-      outputTokens: snapshot.usage.outputTokens,
-      totalTokens: snapshot.usage.totalTokens,
-      lastRequestAtMs: snapshot.usage.lastRequestAtMs,
-    },
-  }));
-}
-
-async function handleUsage(runtime: Runtime): Promise<Response> {
-  const sinceMs = runtime.usageRequestState.lastPollMs;
-  runtime.usageRequestState.lastPollMs = Date.now();
-  return json({
-    startedAtMs: runtime.startedAt,
-    accounts: accountSnapshots(runtime),
-    notifications: runtime.pool.recentNotifications(sinceMs),
-    premiumSessionLimit: PREMIUM_SESSION_LIMIT,
-  }, 200, { "access-control-allow-origin": "*" });
-}
-
 async function handleHealthz(runtime: Runtime): Promise<Response> {
   return json({
     ok: true,
     startedAtMs: runtime.startedAt,
-    models: registryModels(runtime).length,
-    accounts: accountSnapshots(runtime),
+    models: providerModels(runtime).length,
+    provider: "commandcode.ai",
+    liveCatalog: runtime.providerRows.length > 0,
   });
 }
 
-/**
- * Live account management: add/remove accounts while the bridge keeps serving.
- * Persistence goes through the optional store callback (CLI wiring keeps config atomic).
- */
-async function handleAccountsChange(request: Request, runtime: Runtime): Promise<Response> {
-  const body = await request.json().catch(() => null) as { action?: unknown; token?: unknown; name?: unknown } | null;
-  const action = typeof body?.action === "string" ? body.action : "";
-  if (action === "add") {
-    const token = typeof body?.token === "string" ? body.token.trim() : "";
-    if (!token) return errorResponse(400, "token is required");
-    const existing = runtime.pool.listAccounts();
-    if (existing.some(account => account.maskedToken === maskToken(token))) {
-      return errorResponse(409, "that account is already configured");
-    }
-    const probe = new UpstreamClient({ baseUrl: runtime.config.upstreamBaseUrl, requestTimeoutMs: 20_000 });
-    try {
-      await probe.createOrRefreshSession(token);
-    } catch (error) {
-      return json({ ok: false, error: errorText(error) }, 400);
-    }
-    const name = `account-${existing.length + 1}`;
-    runtime.pool.addAccount(new FreebuffAccount({
-      name,
-      token,
-      maskedToken: maskToken(token),
-      client: runtime.client,
-      rotationIntervalMs: runtime.config.rotationIntervalMs,
-      requestTimeoutMs: runtime.config.requestTimeoutMs,
-    }));
-    runtime.onAccountsChanged?.();
-    return json({ ok: true, name, accounts: runtime.pool.size });
-  }
-  if (action === "remove") {
-    const name = typeof body?.name === "string" ? body.name.trim() : "";
-    if (!name) return errorResponse(400, "name is required");
-    if (runtime.pool.size <= 1) return errorResponse(409, "cannot remove the last account");
-    const removed = await runtime.pool.removeAccount(name);
-    if (!removed) return errorResponse(404, `no such account: ${name}`);
-    runtime.onAccountsChanged?.();
-    return json({ ok: true, accounts: runtime.pool.size });
-  }
-  return errorResponse(400, "action must be add or remove");
-}
-
-/** Validate an upstream token without persisting it. */
-async function handleValidateToken(request: Request, runtime: Runtime): Promise<Response> {
-  const body = await request.json().catch(() => null) as { token?: unknown } | null;
-  const token = typeof body?.token === "string" ? body.token.trim() : "";
-  if (!token) return errorResponse(400, "token is required");
+/** Validate a Provider API key without persisting it. */
+async function handleValidateKey(request: Request, runtime: Runtime): Promise<Response> {
+  const body = await request.json().catch(() => null) as { apiKey?: unknown } | null;
+  const apiKey = typeof body?.apiKey === "string" ? body.apiKey.trim() : "";
+  if (!apiKey) return errorResponse(400, "apiKey is required");
+  const probe = new CommancodexClient({
+    apiKey,
+    ...(runtime.config.providerBaseUrl ? { baseUrl: runtime.config.providerBaseUrl } : {}),
+    requestTimeoutMs: 15_000,
+  });
   try {
-    const probe = new UpstreamClient({
-      baseUrl: runtime.config.upstreamBaseUrl,
-      requestTimeoutMs: 15_000,
-    });
-    const session = await probe.createOrRefreshSession(token);
-    return json({
-      valid: true,
-      sessionStatus: session.status,
-      ...(session.instanceId ? { instanceId: session.instanceId } : {}),
-    });
+    const models = await probe.listModels();
+    return json({ valid: true, models: models.length });
   } catch (error) {
     return json({ valid: false, error: errorText(error) });
+  }
+}
+
+/**
+ * Fetch the live Provider API catalog into the runtime. Called at serve startup and
+ * every 10 minutes; failure keeps the last list (or the static fallback rows).
+ */
+export async function refreshProviderModels(runtime: Runtime): Promise<number> {
+  try {
+    const rows = (await runtime.client.listModels())
+      .filter(row => typeof row.id === "string" && row.id.length > 0);
+    if (rows.length > 0) runtime.providerRows = rows;
+    return runtime.providerRows.length;
+  } catch (error) {
+    console.warn(`provider models refresh failed: ${errorText(error)}`);
+    return runtime.providerRows.length;
   }
 }
 
@@ -398,20 +325,15 @@ async function routeRequest(
   request: Request,
   runtime: Runtime,
   path: string,
-  url: URL,
+  _url: URL,
 ): Promise<Response> {
   if (path === "/" && request.method === "GET") {
-    return json({ ok: true, hint: "dashboard removed — see /usage, /healthz, /v1/models" });
+    return json({ ok: true, hint: "commandcodex — see /v1/models, /healthz" });
   }
   if (path === "/v1/models" && request.method === "GET") return await handleModels(runtime);
   if (path === "/v1/responses" && request.method === "POST") return await handleResponses(request, runtime);
   if (path === "/healthz" && request.method === "GET") return await handleHealthz(runtime);
-  if (path === "/usage" && request.method === "GET") return await handleUsage(runtime);
-  if (path === "/notifications" && request.method === "GET") {
-    return json({ notifications: runtime.pool.recentNotifications() });
-  }
-  if (path === "/accounts" && request.method === "POST") return await handleAccountsChange(request, runtime);
-  if (path === "/accounts/validate" && request.method === "POST") return await handleValidateToken(request, runtime);
+  if (path === "/key/validate" && request.method === "POST") return await handleValidateKey(request, runtime);
   return errorResponse(404, `not found: ${path}`);
 }
 
@@ -424,9 +346,14 @@ export function startServer(runtime: Runtime): { stop(): Promise<void>; port: nu
       return handleRequest(request, runtime, ip?.address);
     },
   });
-  console.info(`buffcodex listening on http://${runtime.config.host}:${server.port}/v1`);
+  console.info(`commandcodex listening on http://${runtime.config.host}:${server.port}/v1`);
   return {
     port: runtime.config.port,
     stop: () => server.stop(true),
   };
+}
+
+function supportsModel(runtime: Runtime, modelId: string): boolean {
+  if (!modelId.startsWith("commancodex/")) return false;
+  return providerModels(runtime).includes(modelId.slice("commancodex/".length));
 }

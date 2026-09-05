@@ -1,23 +1,29 @@
+/**
+ * Commandcodex converter tests — chat-completions requests, Anthropic messages requests,
+ * and SSE → AdapterEvent mapping helpers.
+ */
 import { describe, expect, test } from "bun:test";
 import {
   buildChatCompletionRequest,
-  buildChatMessages,
+  buildAnthropicMessagesRequest,
+  collectReasoningTexts,
   parseChatSseChunk,
+  parseAnthropicSse,
   stopReasonFromFinish,
   usageFromChunk,
+  usageFromAnthropic,
   type ChatChunk,
-} from "../src/adapters/freebuff/convert";
-import {
-  freebuffModelCapabilities,
-  resolveReasoningEffort,
-} from "../src/models-catalog";
+  type AnthropicSseEvent,
+} from "../src/commancodex/convert";
+import { isAnthropicModel } from "../src/commancodex/client";
+import { modelCapabilities, resolveReasoningEffort } from "../src/models-catalog";
 import type { CodexParsedRequest } from "../src/types";
 
 const now = Date.now();
 
 function baseParsed(overrides: Partial<CodexParsedRequest> = {}): CodexParsedRequest {
   return {
-    modelId: "z-ai/glm-5.1",
+    modelId: "commancodex/deepseek/deepseek-v4-flash",
     context: { messages: [] },
     stream: true,
     options: {},
@@ -25,202 +31,183 @@ function baseParsed(overrides: Partial<CodexParsedRequest> = {}): CodexParsedReq
   };
 }
 
-describe("buildChatMessages", () => {
-  test("lifts systemPrompt into a system message", () => {
-    const messages = buildChatMessages(baseParsed({
-      context: { systemPrompt: ["You are a coding agent."], messages: [] },
-    }));
-    // The upstream gate requires the CLI marker at messages[0]; Codex's prompt follows.
-    expect(messages).toEqual([
-      { role: "system", content: "You are Buffy, the coding agent behind Codebuff." },
-      { role: "system", content: "You are a coding agent." },
-    ]);
-  });
-
-  test("maps user, assistant tool calls, and tool results", () => {
-    const messages = buildChatMessages(baseParsed({
-      context: {
-        messages: [
-          { role: "user", content: "list files", timestamp: now },
-          {
-            role: "assistant",
-            content: [
-              { type: "thinking", thinking: "I should call the tool" },
-              { type: "toolCall", id: "call_1", name: "shell", arguments: { command: ["ls"] } },
-            ],
-            timestamp: now,
-          },
-          {
-            role: "toolResult",
-            toolCallId: "call_1",
-            toolName: "shell",
-            content: "a.txt\nb.txt",
-            isError: false,
-            timestamp: now,
-          },
-        ],
-      },
-    }));
-    expect(messages).toHaveLength(4);
-    expect(messages[0]).toEqual({ role: "system", content: "You are Buffy, the coding agent behind Codebuff." });
-    expect(messages[1]).toEqual({ role: "user", content: "list files" });
-    const assistant = messages[2] as { role: string; tool_calls?: Array<{ id: string; function: { name: string } }>; reasoning_content?: string };
-    expect(assistant.role).toBe("assistant");
-    expect(assistant.reasoning_content).toBe("I should call the tool");
-    expect(assistant.tool_calls?.[0]?.id).toBe("call_1");
-    expect(assistant.tool_calls?.[0]?.function.name).toBe("shell");
-    expect(messages[3]).toEqual({ role: "tool", tool_call_id: "call_1", content: "a.txt\nb.txt" });
-  });
-
-  test("namespaced tools flatten to namespace__name on round-trip fields", () => {
-    const messages = buildChatMessages(baseParsed({
-      context: {
-        messages: [
-          { role: "user", content: "hi", timestamp: now },
-          {
-            role: "assistant",
-            content: [{ type: "toolCall", id: "c1", name: "search", arguments: {}, namespace: "mcp__docs" }],
-            timestamp: now,
-          },
-        ],
-      },
-    }));
-    const assistant = messages[2] as { tool_calls?: Array<{ function: { name: string } }> };
-    expect(assistant.tool_calls?.[0]?.function.name).toBe("mcp__docs__search");
+describe("isAnthropicModel", () => {
+  test("routes Claude to /messages and everything else to chat-completions", () => {
+    expect(isAnthropicModel("claude-opus-5")).toBe(true);
+    expect(isAnthropicModel("claude-sonnet-4-6")).toBe(true);
+    expect(isAnthropicModel("gpt-5.6-sol")).toBe(false);
+    expect(isAnthropicModel("deepseek/deepseek-v4-pro")).toBe(false);
+    expect(isAnthropicModel("moonshotai/Kimi-K3")).toBe(false);
   });
 });
 
 describe("buildChatCompletionRequest", () => {
-  test("includes codebuff_metadata with run id and free cost mode", () => {
-    const body = buildChatCompletionRequest(baseParsed(), { runId: "run_123" });
-    expect(body.model).toBe("z-ai/glm-5.1");
+  test("maps system, user, and tool results; carries options through", () => {
+    const parsed = baseParsed({
+      context: {
+        systemPrompt: ["You are Codex."],
+        messages: [
+          { role: "user", content: "list the files", timestamp: now },
+          {
+            role: "assistant",
+            content: [
+              { type: "toolCall", id: "call_1", name: "shell", arguments: { command: ["ls"] } },
+            ],
+            timestamp: now,
+          },
+          { role: "toolResult", toolCallId: "call_1", toolName: "shell", content: "a.txt\nb.txt", isError: false, timestamp: now },
+        ],
+        tools: [
+          { name: "shell", description: "run shell", parameters: { type: "object", properties: {} } },
+          { name: "apply_patch", description: "patch", parameters: { type: "object", properties: {} }, freeform: true },
+        ],
+      },
+      options: { temperature: 0.2, maxOutputTokens: 512, reasoning: "high" },
+    });
+    const body = buildChatCompletionRequest(parsed, "deepseek/deepseek-v4-flash");
+    expect(body.model).toBe("deepseek/deepseek-v4-flash");
     expect(body.stream).toBe(true);
-    expect(body.codebuff_metadata.run_id).toBe("run_123");
-    expect(body.codebuff_metadata.cost_mode).toBe("free");
-    expect(typeof body.codebuff_metadata.client_id).toBe("string");
-  });
-
-  test("propagates session instance id into metadata", () => {
-    const body = buildChatCompletionRequest(baseParsed(), { runId: "r", sessionInstanceId: "inst_9" });
-    expect(body.codebuff_metadata.freebuff_instance_id).toBe("inst_9");
-  });
-
-  test("maps options: reasoning effort, temperature, stop, max tokens", () => {
-    const body = buildChatCompletionRequest(baseParsed({
-      options: { reasoning: "high", temperature: 0.4, maxOutputTokens: 900, stopSequences: ["END"] },
-    }), { runId: "r" });
+    const systemMessages = body.messages.filter(message => message.role === "system");
+    expect(systemMessages).toHaveLength(1);
+    expect(JSON.stringify(body.messages)).toContain("call_1");
+    // Freeform tools cannot ride the function format — dropped, not crash.
+    expect(body.tools?.map(tool => tool.function.name)).toEqual(["shell"]);
+    expect(body.temperature).toBe(0.2);
+    expect(body.max_tokens).toBe(512);
     expect(body.reasoning_effort).toBe("high");
-    expect(body.temperature).toBe(0.4);
-    expect(body.max_tokens).toBe(900);
-    expect(body.stop).toBe("END");
   });
 
-  test("omits reasoning_effort for none", () => {
-    const body = buildChatCompletionRequest(baseParsed({ options: { reasoning: "none" } }), { runId: "r" });
+  test("strips reasoning_effort for non-thinking models", () => {
+    const parsed = baseParsed({
+      modelId: "commancodex/mimo/mimo-v2.5",
+      options: { reasoning: "max" },
+    });
+    const body = buildChatCompletionRequest(parsed, "mimo/mimo-v2.5");
     expect(body.reasoning_effort).toBeUndefined();
   });
 
-  test("strips reasoning_effort entirely for non-thinking models", () => {
-    for (const modelId of ["mimo/mimo-v2.5", "upstage/solar-pro4"]) {
-      const body = buildChatCompletionRequest(
-        baseParsed({ modelId, options: { reasoning: "max" } }),
-        { runId: "r" },
-     );
-      expect(body.reasoning_effort).toBeUndefined();
-    }
-  });
-
-  test("sends glm-5.3-flash effort verbatim within its low/high/max ladder", () => {
-    const body = buildChatCompletionRequest(
-      baseParsed({ modelId: "z-ai/glm-5.3-flash", options: { reasoning: "max" } }),
-      { runId: "r" },
-    );
-    expect(body.reasoning_effort).toBe("max");
-  });
-
-  test("clamps out-of-ladder effort to the nearest supported value (ties up)", () => {
-    // glm-5.3-flash has no medium; medium should clamp up to high.
-    const body = buildChatCompletionRequest(
-      baseParsed({ modelId: "z-ai/glm-5.3-flash", options: { reasoning: "medium" } }),
-      { runId: "r" },
-    );
-    expect(body.reasoning_effort).toBe("high");
+  test("no CLI-fingerprint fields leak into the official request", () => {
+    const body = buildChatCompletionRequest(baseParsed(), "gpt-5.6-sol");
+    expect(JSON.stringify(body)).not.toContain("codebuff_metadata");
+    expect(JSON.stringify(body)).not.toContain("write_todos");
+    expect(JSON.stringify(body)).not.toContain("data_collection");
   });
 });
 
-describe("per-model thinking ladders", () => {
-  test("verified ladders match the web UI", () => {
-    expect(freebuffModelCapabilities("z-ai/glm-5.3-flash").efforts).toEqual(["low", "high", "max"]);
-    expect(freebuffModelCapabilities("deepseek/deepseek-v4-flash").efforts).toEqual(["low", "high", "max"]);
-    expect(freebuffModelCapabilities("openai/gpt-5.6-luna").efforts)
-      .toEqual(["low", "medium", "high", "xhigh", "max"]);
-    expect(freebuffModelCapabilities("openai/gpt-5.6-luna-max").efforts)
-      .toEqual(["low", "medium", "high", "xhigh", "max"]);
-    expect(freebuffModelCapabilities("deepseek/deepseek-v4-pro-max").reasoning).toBe(true);
+describe("buildAnthropicMessagesRequest", () => {
+  test("builds system + thinking + tools in Anthropic shape", () => {
+    const parsed = baseParsed({
+      modelId: "commancodex/claude-opus-5",
+      context: {
+        systemPrompt: ["You are Codex."],
+        messages: [
+          { role: "user", content: "hi", timestamp: now },
+          {
+            role: "assistant",
+            content: [
+              { type: "thinking", thinking: "pondering", signature: "sig123" },
+              { type: "text", text: "hello" },
+            ],
+            timestamp: now,
+          },
+          { role: "user", content: "use the tool", timestamp: now },
+        ],
+        tools: [{ name: "shell", description: "run shell", parameters: { type: "object", properties: {} } }],
+      },
+      options: { reasoning: "high", maxOutputTokens: 16_000 },
+    });
+    const body = buildAnthropicMessagesRequest(parsed, "claude-opus-5");
+    expect(body.model).toBe("claude-opus-5");
+    expect(body.system).toBe("You are Codex.");
+    expect(body.max_tokens).toBe(16_000);
+    expect(body.thinking?.type).toBe("enabled");
+    expect(body.thinking!.budget_tokens).toBeLessThan(16_000);
+    expect(body.tools).toHaveLength(1);
+    expect(body.tools![0]!.name).toBe("shell");
+    const assistant = body.messages.find(message => message.role === "assistant");
+    expect(Array.isArray(assistant!.content)).toBe(true);
+    const blocks = assistant!.content as Array<{ type: string }>;
+    expect(blocks.some(block => block.type === "thinking")).toBe(true);
   });
 
-  test("verified non-thinking models report no reasoning", () => {
-    for (const modelId of ["mimo/mimo-v2.5", "upstage/solar-pro4"]) {
-      const caps = freebuffModelCapabilities(modelId);
-      expect(caps.reasoning).toBe(false);
-      expect(caps.efforts).toEqual([]);
-    }
-  });
-
-  test("glm-5.2 falls back to the family ladder; unknown models do not think", () => {
-    expect(freebuffModelCapabilities("z-ai/glm-5.2")).toEqual({ reasoning: true, efforts: ["low", "medium", "high"] });
-    expect(freebuffModelCapabilities("crof/kimi-k3-eco")).toEqual({ reasoning: true, efforts: ["low", "medium", "high"] });
-    expect(freebuffModelCapabilities("somevendor/unknown-model").reasoning).toBe(false);
-  });
-
-  test("resolveReasoningEffort edge cases", () => {
-    expect(resolveReasoningEffort("mimo/mimo-v2.5", "max")).toBeUndefined();
-    expect(resolveReasoningEffort("upstage/solar-pro4", "high")).toBeUndefined();
-    expect(resolveReasoningEffort("z-ai/glm-5.3-flash", "xhigh")).toBe("max");
-    expect(resolveReasoningEffort("z-ai/glm-5.3-flash", "minimal")).toBeUndefined();
-    expect(resolveReasoningEffort("deepseek/deepseek-v4-flash", "medium")).toBe("high");
-    expect(resolveReasoningEffort("deepseek/deepseek-v4-flash", "ultra")).toBe("max");
-    expect(resolveReasoningEffort("openai/gpt-5.6-luna", "xhigh")).toBe("xhigh");
-    expect(resolveReasoningEffort("z-ai/glm-5.2", "xhigh")).toBe("high");
+  test("unsigned thinking is not replayed (Anthropic requires signatures)", () => {
+    const parsed = baseParsed({
+      modelId: "commancodex/claude-opus-5",
+      context: {
+        messages: [
+          {
+            role: "assistant",
+            content: [{ type: "thinking", thinking: "no signature here" }],
+            timestamp: now,
+          },
+          { role: "user", content: "go on", timestamp: now },
+        ],
+      },
+    });
+    const body = buildAnthropicMessagesRequest(parsed, "claude-opus-5");
+    const assistant = body.messages.find(message => message.role === "assistant");
+    const blocks = assistant!.content as Array<{ type: string }>;
+    expect(blocks.some(block => block.type === "thinking")).toBe(false);
   });
 });
 
-describe("parseChatSseChunk", () => {
-  test("parses data frames and ignores comments/done/keepalives", () => {
-    expect(parseChatSseChunk('data: {"choices":[]}')).toEqual({ choices: [] });
+describe("SSE parsing", () => {
+  test("chat chunks parse, [DONE] and comments drop", () => {
+    expect(parseChatSseChunk('data: {"choices":[{"delta":{"content":"hi"}}]}') as ChatChunk | null)
+      .toEqual({ choices: [{ delta: { content: "hi" } }] });
     expect(parseChatSseChunk("data: [DONE]")).toBeNull();
     expect(parseChatSseChunk(": keepalive")).toBeNull();
-    expect(parseChatSseChunk("")).toBeNull();
-    expect(parseChatSseChunk("data: not-json")).toBeNull();
-  });
-});
-
-describe("usageFromChunk", () => {
-  test("maps prompt/completion/cached tokens", () => {
-    const mapped = usageFromChunk({
-      prompt_tokens: 100,
-      completion_tokens: 40,
-      total_tokens: 140,
-      prompt_tokens_details: { cached_tokens: 60 },
-    });
-    expect(mapped?.usage.inputTokens).toBe(100);
-    expect(mapped?.usage.outputTokens).toBe(40);
-    expect(mapped?.usage.totalTokens).toBe(140);
-    expect(mapped?.usage.cachedInputTokens).toBe(60);
+    expect(parseChatSseChunk("not sse")).toBeNull();
   });
 
-  test("returns undefined for missing usage", () => {
-    expect(usageFromChunk(undefined)).toBeUndefined();
+  test("anthropic events parse", () => {
+    const event = parseAnthropicSse('data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"hey"}}') as AnthropicSseEvent | null;
+    expect(event?.type).toBe("content_block_delta");
+    expect(event?.delta?.text).toBe("hey");
   });
-});
 
-describe("stopReasonFromFinish", () => {
-  test("maps finish reasons to adapter stop reasons", () => {
-    expect(stopReasonFromFinish("stop")).toBe("stop");
+  test("usage maps from both wire shapes", () => {
+    const chatUsage = usageFromChunk({ prompt_tokens: 100, completion_tokens: 20, total_tokens: 120, prompt_tokens_details: { cached_tokens: 40 } });
+    expect(chatUsage?.inputTokens).toBe(100);
+    expect(chatUsage?.outputTokens).toBe(20);
+    expect(chatUsage?.cachedInputTokens).toBe(40);
+    const anthropicEvent = {
+      type: "message_start",
+      message: { usage: { input_tokens: 50, output_tokens: 1, cache_read_input_tokens: 25, cache_creation_input_tokens: 5 } },
+    } as AnthropicSseEvent;
+    const anthropicUsage = usageFromAnthropic(anthropicEvent);
+    expect(anthropicUsage?.inputTokens).toBe(50);
+    expect(anthropicUsage?.cachedInputTokens).toBe(25);
+    expect(anthropicUsage?.cacheCreationInputTokens).toBe(5);
+  });
+
+  test("stop reasons normalize", () => {
     expect(stopReasonFromFinish("tool_calls")).toBe("tool_use");
-    expect(stopReasonFromFinish("function_call")).toBe("tool_use");
-    expect(stopReasonFromFinish("length")).toBe("max_tokens");
-    expect(stopReasonFromFinish("content_filter")).toBe("content_filter");
-    expect(stopReasonFromFinish(null)).toBeUndefined();
+    expect(stopReasonFromFinish("max_tokens")).toBe("max_tokens");
+    expect(stopReasonFromFinish("end_turn")).toBe("stop");
+    expect(stopReasonFromFinish(undefined)).toBeUndefined();
+  });
+});
+
+describe("model capabilities", () => {
+  test("thinking vs non-thinking detection", () => {
+    expect(modelCapabilities("claude-opus-5").reasoning).toBe(true);
+    expect(modelCapabilities("gpt-5.3-codex").reasoning).toBe(true);
+    expect(modelCapabilities("mimo/mimo-v2.5").reasoning).toBe(false);
+    expect(modelCapabilities("upstage/solar-pro4").reasoning).toBe(false);
+  });
+
+  test("efforts clamp to the model ladder, ties up", () => {
+    expect(resolveReasoningEffort("mimo/mimo-v2.5", "max")).toBeUndefined();
+    expect(resolveReasoningEffort("deepseek/deepseek-v4-flash", "medium")).toBe("high");
+    expect(resolveReasoningEffort("claude-opus-5", "xhigh")).toBe("high");
+  });
+});
+
+describe("collectReasoningTexts", () => {
+  test("handles strings, arrays, and {text} objects", () => {
+    expect(collectReasoningTexts("plain")).toEqual(["plain"]);
+    expect(collectReasoningTexts([{ text: "a" }, "b"])).toEqual(["a", "b"]);
+    expect(collectReasoningTexts(null)).toEqual([]);
   });
 });

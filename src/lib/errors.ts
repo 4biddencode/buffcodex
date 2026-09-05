@@ -279,3 +279,8 @@ export function httpStatusFromTerminalError(error: {
   if (message) return inferHttpStatusFromAdapterMessage(message);
   return 502;
 }
+
+/** Human-readable message from any thrown value. */
+export function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
