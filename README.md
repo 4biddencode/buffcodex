@@ -38,10 +38,10 @@ From a checkout of this repo:
 tools/install-mac.sh
 ```
 
-That builds the binary, puts `buffcodex` on your PATH, installs + starts the background
-service (LaunchAgent), routes Codex through the bridge, and restarts the ChatGPT app with
-the new model catalog. Re-run it any time after updating — accounts in
-`~/.buffcodex/config.json` are never touched.
+That builds both binaries (bridge + catalog muxer), puts them on your PATH, installs + starts
+the background services (LaunchAgents), routes Codex through the muxer, and restarts the
+Codex/ChatGPT app with the merged model catalog. Re-run it any time after updating — accounts
+in `~/.buffcodex/config.json` are never touched.
 
 ### Manual install
 ```bash

@@ -144,15 +144,29 @@ async function cmdDoctor(): Promise<void> {
 /** Codex's default model after install — the strongest free thinking model. */
 const DEFAULT_CODEX_MODEL = "z-ai/glm-5.3-flash";
 
-function routeUrl(config: BuffcodexConfig): string {
+/** The muxer merges the ChatGPT-app's native catalog with the Freebuff rows. The app only
+ *  renders rows that carry the native schema (muxer builds those from its own template);
+ *  raw 17999 rows are fine for the plain Codex CLI but invisible in the app's picker. */
+const MUXER_URL = "http://127.0.0.1:17850";
+
+async function routeUrl(config: BuffcodexConfig): Promise<string> {
   // Dialing is not binding: Codex always talks to the bridge via loopback, even when the
   // server binds 0.0.0.0 for LAN-wide access.
+  try {
+    const response = await fetch(`${MUXER_URL}/v1/models`, { signal: AbortSignal.timeout(4_000) });
+    if (response.ok) {
+      const body = (await response.json()) as { models?: unknown[] };
+      if (Array.isArray(body.models) && body.models.length > 0) return `${MUXER_URL}/v1`;
+    }
+  } catch {
+    // muxer not running — fall through to the raw bridge
+  }
   return `http://127.0.0.1:${config.port}/v1`;
 }
 
 async function cmdCodexInstall(): Promise<void> {
   const config = ensureConfig();
-  const route = routeUrl(config);
+  const route = await routeUrl(config);
   let text = existsSync(CODEX_CONFIG_PATH) ? readFileSync(CODEX_CONFIG_PATH, "utf8") : "";
   const backupPath = `${CODEX_CONFIG_PATH}.buffcodex-backup`;
   if (!existsSync(backupPath)) writeFileSync(backupPath, text, { mode: 0o600 });
@@ -199,13 +213,12 @@ async function cmdCodexInstall(): Promise<void> {
     if (trimmed.startsWith("[")) { insideTable = false; continue; }
     if (!insideTable && /^(openai_base_url|model_provider)\s*=/.test(trimmed)) lines.splice(i, 1);
     if (!insideTable && needsDefaultModel && /^model\s*=/.test(trimmed)) lines.splice(i, 1);
-    // A stale effort pin (e.g. chatgpt-web-era "low") may exist with or without a model
-    // line — either way it must go, or our managed block would duplicate the TOML key.
-    if (!insideTable && needsDefaultModel && /^model_reasoning_effort\s*=/.test(trimmed)) lines.splice(i, 1);
+    // A global effort pin hides the app's per-model intensity picker — never keep one,
+    // ours or the user's ('codex remove' restores the backup if it was wanted).
+    if (!insideTable && /^model_reasoning_effort\s*=/.test(trimmed)) lines.splice(i, 1);
   }
   if (needsDefaultModel) {
     managedLines.splice(3, 0, `model = "${DEFAULT_CODEX_MODEL}"`);
-    managedLines.splice(4, 0, `model_reasoning_effort = "max"`);
   }
   // 3) Top-level keys are only valid BEFORE the first table header — insert there, not at EOF.
   const firstTable = lines.findIndex(line => line.trim().startsWith("["));
