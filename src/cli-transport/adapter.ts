@@ -83,6 +83,7 @@ export const TOOL_PROTOCOL_INSTRUCTIONS = [
   "",
   "Rules:",
   "- The tag content MUST be a single valid JSON object with keys `name` and `arguments`.",
+  "- Only call tools that appear in the Available tools list. NEVER invent tool names, and NEVER call tools from any other system.",
   "- Emit at most ONE tool tag per reply, and NOTHING else in that reply (no prose, no markdown fences around it).",
   "- Do not simulate, describe, or narrate tool results. Emit the tag and stop; the orchestrator will run the tool and send you the result.",
   "- If no tool is needed, answer in plain text.",
@@ -139,6 +140,33 @@ export function hasOpenToolTag(text: string): boolean {
   const start = text.lastIndexOf(TOOL_OPEN);
   if (start === -1) return false;
   return text.indexOf(TOOL_CLOSE, start) === -1;
+}
+
+/**
+ * Consume streamed text: emit everything that is SAFE to show, extract one complete
+ * tool tag if present, and hold back anything that could still become part of a tag
+ * (an unterminated tag, or a trailing partial opening marker). This is the single
+ * gatekeeper between the model's raw text stream and the user — a complete tag
+ * arriving inside one delta must NEVER reach the visible stream.
+ */
+export function drainTextBuffer(buffer: string): { visible: string; tag: ParsedToolTag | null; rest: string } {
+  const { tag, rest } = extractToolTag(buffer);
+  if (tag) return { visible: tag.raw, tag, rest };
+  let safe = buffer.length;
+  const openIndex = buffer.indexOf(TOOL_OPEN);
+  if (openIndex !== -1) {
+    // Unterminated tag: hold everything from the marker on.
+    safe = openIndex;
+  } else {
+    // Trailing partial opening marker: hold it back until we know it is not a tag.
+    for (let keep = Math.min(TOOL_OPEN.length - 1, buffer.length); keep > 0; keep--) {
+      if (buffer.endsWith(TOOL_OPEN.slice(0, keep))) {
+        safe = buffer.length - keep;
+        break;
+      }
+    }
+  }
+  return { visible: buffer.slice(0, safe), tag: null, rest: buffer.slice(safe) };
 }
 
 // ---------------------------------------------------------------------------
@@ -429,22 +457,7 @@ export function createCliAdapter(options: CliAdapterOptions): ProviderAdapter {
           const delta = event.delta ?? "";
           if (!delta) break;
           toolBuffer += delta;
-          // Hold back any trailing partial tool tag: it must never reach the user.
-          let safeLength = toolBuffer.length;
-          if (hasOpenToolTag(toolBuffer)) {
-            const openIndex = toolBuffer.lastIndexOf(TOOL_OPEN);
-            safeLength = openIndex;
-          } else {
-            // Also hold back a partial opening marker at the very end.
-            for (let keep = Math.min(TOOL_OPEN.length - 1, toolBuffer.length); keep > 0; keep--) {
-              if (toolBuffer.endsWith(TOOL_OPEN.slice(0, keep))) { safeLength = toolBuffer.length - keep; break; }
-            }
-          }
-          if (safeLength > 0) {
-            const visible = toolBuffer.slice(0, safeLength);
-            toolBuffer = toolBuffer.slice(safeLength);
-            if (visible) emit({ type: "text_delta", text: visible, phase: "final_answer" });
-          }
+          drainBuffer();
           break;
         }
         case "model_request_end": {
@@ -461,18 +474,13 @@ export function createCliAdapter(options: CliAdapterOptions): ProviderAdapter {
     let toolBuffer = "";
 
     const drainBuffer = (): void => {
-      // Extract complete tool tags; emit residual text.
       for (;;) {
-        const { tag, rest } = extractToolTag(toolBuffer);
+        const { visible, tag, rest } = drainTextBuffer(toolBuffer);
+        if (visible) emit({ type: "text_delta", text: visible, phase: "final_answer" });
         if (!tag) {
-          if (!hasOpenToolTag(toolBuffer) && toolBuffer) {
-            emit({ type: "text_delta", text: toolBuffer, phase: "final_answer" });
-            toolBuffer = "";
-          }
+          toolBuffer = rest;
           return;
         }
-        // Text before the tag goes out first.
-        if (tag.raw) emit({ type: "text_delta", text: tag.raw, phase: "final_answer" });
         sawToolTag = true;
         finishTool(); // close any previous tool before starting a new one
         toolSeq += 1;

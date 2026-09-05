@@ -7,6 +7,7 @@ import {
   buildCliPrompt,
   extractToolTag,
   hasOpenToolTag,
+  drainTextBuffer,
   errorEventForExit,
   stopReasonFromCli,
   TOOL_PROTOCOL_INSTRUCTIONS,
@@ -73,6 +74,40 @@ describe("extractToolTag", () => {
     const { tag, rest } = extractToolTag("<ccx-tool>not json</ccx-tool>");
     expect(tag).toBeNull();
     expect(rest).toBe("not json");
+  });
+
+  test("drain: a COMPLETE tag inside one delta never reaches the visible stream", () => {
+    // Regression: this exact leak shipped to the app as raw text.
+    const leaked = '<ccx-tool>{"name": "write_stdin", "arguments": {"chars": "", "session_id": 0}}</ccx-tool>';
+    const { visible, tag, rest } = drainTextBuffer(leaked);
+    expect(visible).toBe("");
+    expect(tag?.name).toBe("write_stdin");
+    expect(tag?.arguments).toEqual({ chars: "", session_id: 0 });
+    expect(rest).toBe("");
+  });
+
+  test("drain: text around a tag is emitted, tag extracted, tail preserved", () => {
+    const { visible, tag, rest } = drainTextBuffer('checking<ccx-tool>{"name":"shell","arguments":{}}</ccx-tool>tail');
+    expect(visible).toBe("checking");
+    expect(tag?.name).toBe("shell");
+    expect(rest).toBe("tail");
+  });
+
+  test("drain: unterminated tag and partial markers are held back", () => {
+    const partial = drainTextBuffer('ok <ccx-tool>{"name":"sh');
+    expect(partial.visible).toBe("ok ");
+    expect(partial.tag).toBeNull();
+    expect(partial.rest).toBe('<ccx-tool>{"name":"sh');
+    const marker = drainTextBuffer("plain text <cc");
+    expect(marker.visible).toBe("plain text ");
+    expect(marker.rest).toBe("<cc");
+  });
+
+  test("drain: plain text passes through untouched", () => {
+    const { visible, tag, rest } = drainTextBuffer("just an answer");
+    expect(visible).toBe("just an answer");
+    expect(tag).toBeNull();
+    expect(rest).toBe("");
   });
 });
 
