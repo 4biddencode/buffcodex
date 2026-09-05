@@ -299,11 +299,9 @@ async function handleValidateKey(request: Request, runtime: Runtime): Promise<Re
  * every 10 minutes; failure keeps the last list (or the static fallback rows).
  */
 export async function refreshProviderModels(runtime: Runtime): Promise<number> {
-  if (runtime.config.transport === "cli") {
-    // The CLI transport has no models endpoint to poll; the static catalog stands.
-    return runtime.providerRows.length;
-  }
   try {
+    // The catalog endpoint is not plan-gated (only model calls are), so it serves both
+    // transports: context windows + names for api, model ids for cli.
     const rows = (await runtime.client.listModels())
       .filter(row => typeof row.id === "string" && row.id.length > 0);
     if (rows.length > 0) runtime.providerRows = rows;
@@ -369,5 +367,9 @@ export function startServer(runtime: Runtime): { stop(): Promise<void>; port: nu
 
 function supportsModel(runtime: Runtime, modelId: string): boolean {
   if (!modelId.startsWith("commancodex/")) return false;
+  // CLI transport: the upstream validates model ids itself (bad ids map to a CLI error
+  // event), so every commancodex/* slug is accepted — the live catalog can lag the
+  // provider's real list and must not gate valid models.
+  if (runtime.config.transport === "cli") return true;
   return providerModels(runtime).includes(modelId.slice("commancodex/".length));
 }
