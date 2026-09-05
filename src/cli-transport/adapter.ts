@@ -11,6 +11,9 @@
  * tool_call events instead of leaking raw tags to the user.
  */
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import type { IncomingMeta, ProviderAdapter } from "../adapters/base";
 import type { AdapterEvent, CodexContentPart, CodexMessage, CodexParsedRequest, CodexTool } from "../types";
 import { errorText } from "../lib/errors";
@@ -259,6 +262,31 @@ export interface CliAdapterOptions extends CliOptions {
   resolveEffort?: (modelId: string, requested?: string) => string | undefined;
 }
 
+/**
+ * Resolve the CLI binary. launchd agents run with a minimal PATH, so a bare name is
+ * searched against the usual install locations (bun global, homebrew, npm global) in
+ * addition to the inherited PATH.
+ */
+function resolveCliBin(cliPath: string | undefined): string {
+  const configured = cliPath?.trim() || CLI_DEFAULT;
+  if (configured.includes("/")) return configured;
+  const extraDirs = [
+    join(homedir(), ".bun", "bin"),
+    "/opt/homebrew/bin",
+    "/opt/homebrew/opt/node/bin",
+    "/usr/local/bin",
+    join(homedir(), "bin"),
+  ];
+  for (const dir of [...extraDirs, ...(process.env.PATH ?? "").split(":")]) {
+    if (!dir) continue;
+    const candidate = join(dir, configured);
+    try {
+      if (existsSync(candidate)) return candidate;
+    } catch { /* keep searching */ }
+  }
+  return configured; // let spawn produce its own ENOENT error message
+}
+
 interface PendingTool {
   id: string;
   name: string;
@@ -300,16 +328,38 @@ export function createCliAdapter(options: CliAdapterOptions): ProviderAdapter {
     emit: (event: AdapterEvent) => void,
   ): Promise<void> {
     const prompt = buildCliPrompt(parsed);
-    const child = spawn(options.cliPath ?? CLI_DEFAULT, buildArgs(parsed), {
-      stdio: ["pipe", "pipe", "pipe"],
-      env: {
-        ...process.env,
-        COMMAND_CODE_API_KEY: apiKey,
-        ...(options.cwd ? { cwd: options.cwd } : {}),
-        // Non-interactive: never trip TTY detection.
-        CI: "1",
-      },
-    });
+    // The CLI is a `#!/usr/bin/env node` script — node must be on the child's PATH.
+    const cliBin = resolveCliBin(options.cliPath);
+    const childEnvPath = [
+      join(homedir(), ".bun", "bin"),
+      "/opt/homebrew/opt/node/bin",
+      "/opt/homebrew/bin",
+      "/usr/local/bin",
+      process.env.PATH ?? "/usr/bin:/bin",
+    ].join(":");
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = spawn(cliBin, buildArgs(parsed), {
+        stdio: ["pipe", "pipe", "pipe"],
+        env: {
+          ...process.env,
+          PATH: childEnvPath,
+          COMMAND_CODE_API_KEY: apiKey,
+          ...(options.cwd ? { cwd: options.cwd } : {}),
+          // Non-interactive: never trip TTY detection.
+          CI: "1",
+        },
+      });
+    } catch (error) {
+      emit({
+        type: "error",
+        message: `failed to launch the command-code CLI (${cliBin}): ${errorText(error)}. Install it with 'bun add -g command-code' or set cliPath in config.json.`,
+        status: 502,
+        errorType: "server_error",
+        code: "cli_spawn_failed",
+      });
+      return;
+    }
 
     let stderr = "";
     let settled = false;
@@ -411,9 +461,11 @@ export function createCliAdapter(options: CliAdapterOptions): ProviderAdapter {
       }
     };
 
-    child.stdout.setEncoding("utf8");
+    const stdout = child.stdout!;
+    const stderrStream = child.stderr!;
+    stdout.setEncoding("utf8");
     let lineBuf = "";
-    child.stdout.on("data", (chunk: string) => {
+    stdout.on("data", (chunk: string) => {
       lineBuf += chunk;
       let newlineIndex: number;
       while ((newlineIndex = lineBuf.indexOf("\n")) !== -1) {
@@ -429,8 +481,8 @@ export function createCliAdapter(options: CliAdapterOptions): ProviderAdapter {
         }
       }
     });
-    child.stderr.setEncoding("utf8");
-    child.stderr.on("data", (chunk: string) => {
+    stderrStream.setEncoding("utf8");
+    stderrStream.on("data", (chunk: string) => {
       stderr += chunk;
       if (stderr.length > 64_000) stderr = stderr.slice(-32_000);
     });
