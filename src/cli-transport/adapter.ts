@@ -314,11 +314,13 @@ export function createCliAdapter(options: CliAdapterOptions): ProviderAdapter {
     },
   };
 
-  function buildArgs(parsed: CodexParsedRequest): string[] {
+  function buildArgs(parsed: CodexParsedRequest, includeEffort: boolean): string[] {
     const args = ["-p", "--output-format", "json", "--skip-onboarding"];
     args.push("-m", resolveCliModel(parsed.modelId));
-    const effort = resolveEffort?.(parsed.modelId, parsed.options.reasoning);
-    if (effort) args.push("--effort", effort);
+    if (includeEffort) {
+      const effort = resolveEffort?.(parsed.modelId, parsed.options.reasoning);
+      if (effort) args.push("--effort", effort);
+    }
     return args;
   }
 
@@ -327,8 +329,31 @@ export function createCliAdapter(options: CliAdapterOptions): ProviderAdapter {
     incoming: IncomingMeta,
     emit: (event: AdapterEvent) => void,
   ): Promise<void> {
+    // Some models hard-reject --effort ("MiniMax M3 has no adjustable reasoning effort.").
+    // First attempt carries the requested effort; if the CLI refuses it, retry once
+    // without — later turns then never pass an effort for that model.
     const prompt = buildCliPrompt(parsed);
-    // The CLI is a `#!/usr/bin/env node` script — node must be on the child's PATH.
+    let includeEffort = true;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const fatal = await runChild(parsed, incoming, emit, prompt, includeEffort);
+      if (!fatal) return;
+      if (fatal.kind === "effort-rejected" && attempt === 0) {
+        console.info(`[${parsed.modelId}] effort rejected upstream — retrying without --effort`);
+        includeEffort = false;
+        continue;
+      }
+      emit(errorEventForExit(fatal.exitCode, fatal.stderr));
+      return;
+    }
+  }
+
+  async function runChild(
+    parsed: CodexParsedRequest,
+    incoming: IncomingMeta,
+    emit: (event: AdapterEvent) => void,
+    prompt: string,
+    includeEffort: boolean,
+  ): Promise<{ kind: "effort-rejected"; exitCode: number; stderr: string } | { kind: "final"; exitCode: number; stderr: string } | null> {
     const cliBin = resolveCliBin(options.cliPath);
     const childEnvPath = [
       join(homedir(), ".bun", "bin"),
@@ -339,7 +364,7 @@ export function createCliAdapter(options: CliAdapterOptions): ProviderAdapter {
     ].join(":");
     let child: ReturnType<typeof spawn>;
     try {
-      child = spawn(cliBin, buildArgs(parsed), {
+      child = spawn(cliBin, buildArgs(parsed, includeEffort), {
         stdio: ["pipe", "pipe", "pipe"],
         env: {
           ...process.env,
@@ -358,7 +383,7 @@ export function createCliAdapter(options: CliAdapterOptions): ProviderAdapter {
         errorType: "server_error",
         code: "cli_spawn_failed",
       });
-      return;
+      return { kind: "final", exitCode: 0, stderr: "" };
     }
 
     let stderr = "";
@@ -538,8 +563,12 @@ export function createCliAdapter(options: CliAdapterOptions): ProviderAdapter {
     void sawToolTag;
 
     if (exitCode !== 0 && exitCode !== null) {
-      emit(errorEventForExit(exitCode, stderr));
-      return;
+      // Effort-rejection detection: matches the CLI's exact wording for fixed-effort
+      // models. Emit nothing — the caller retries without the flag.
+      if (/no adjustable reasoning effort/i.test(stderr)) {
+        return { kind: "effort-rejected", exitCode, stderr };
+      }
+      return { kind: "final", exitCode, stderr };
     }
 
     emit({
@@ -548,5 +577,6 @@ export function createCliAdapter(options: CliAdapterOptions): ProviderAdapter {
       endTurn: !currentTool,
       usage,
     });
+    return null;
   }
 }

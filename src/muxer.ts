@@ -41,6 +41,7 @@ const EFFORT_DESCRIPTIONS: Record<string, string> = {
   xhigh: "Very deep deliberation. Much slower replies.",
   max: "Maximum deliberation this model allows.",
   none: "No deliberation — this model does not think.",
+  fixed: "Fixed reasoning effort — this model does not offer adjustable reasoning.",
 };
 
 const FULL_LADDER = ["low", "medium", "high", "xhigh", "max"];
@@ -55,11 +56,14 @@ const THINKING_LADDERS: Array<{ match: RegExp; efforts: string[] }> = [
 ];
 const THINKING_FAMILY_PATTERN = /(glm|deepseek|kimi|qwen|minimax|gemini|claude|gpt-5|grok|fable|nemotron)/i;
 const NON_THINKING_PATTERN = /(^|\/)(mimo|solar)/i;
+/** Models that think but do not offer adjustable effort (hard upstream error on --effort). */
+const FIXED_EFFORT_PATTERN = /minimax/i;
 
 function commancodexLadder(upstreamId: string): string[] {
   const known = THINKING_LADDERS.find(entry => entry.match.test(upstreamId));
   if (known) return known.efforts;
   if (NON_THINKING_PATTERN.test(upstreamId)) return ["none"];
+  if (FIXED_EFFORT_PATTERN.test(upstreamId)) return ["fixed"];
   if (THINKING_FAMILY_PATTERN.test(upstreamId)) return STANDARD_LADDER;
   return ["none"];
 }
@@ -82,7 +86,7 @@ function buildAppModelRow(templateValue: JsonObject, slug: string, bridgeModels:
   const compactLimit = Math.min(AUTO_COMPACT_TOKEN_LIMIT, Math.floor(window * 0.9));
   const displayName = `Commancodex — ${upstreamId.split("/").pop() ?? upstreamId}`;
   const thinking = !(ladder.length === 1 && ladder[0] === "none");
-  const defaultLevel = thinking ? ladder[ladder.length - 1]! : "low";
+  const defaultLevel = thinking && ladder[0] !== "fixed" ? ladder[ladder.length - 1]! : "low";
   const model: JsonObject = {
     ...template,
     slug,

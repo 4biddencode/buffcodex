@@ -46,6 +46,23 @@ const THINKING_LADDERS: Array<{ match: RegExp; efforts: ReasoningEffort[] }> = [
 const THINKING_FAMILY_PATTERN = /(glm|deepseek|kimi|qwen|minimax|gemini|claude|gpt-5|grok|fable|nemotron)/i;
 const NON_THINKING_PATTERN = /(^|\/)(mimo|solar)/i;
 
+/**
+ * Models that think but expose NO adjustable effort (verified: "MiniMax M3 has no
+ * adjustable reasoning effort."). Passing an effort flag/field for these is a hard
+ * upstream error — the catalog advertises one fixed level and the transports strip
+ * the effort entirely.
+ */
+const FIXED_EFFORT_PATTERN = /minimax/i;
+
+export function modelAdjustableEffort(upstreamId: string): boolean {
+  return !FIXED_EFFORT_PATTERN.test(upstreamId);
+}
+
+export const FIXED_EFFORT_LEVEL = {
+  effort: "low",
+  description: "Fixed reasoning effort — this model does not offer adjustable reasoning.",
+} as const;
+
 export function modelCapabilities(upstreamId: string): ModelCapabilities {
   if (NON_THINKING_PATTERN.test(upstreamId)) return { reasoning: false, efforts: [] };
   const known = THINKING_LADDERS.find(entry => entry.match.test(upstreamId));
@@ -61,6 +78,8 @@ export function modelCapabilities(upstreamId: string): ModelCapabilities {
  */
 export function resolveReasoningEffort(upstreamId: string, requested?: string): ReasoningEffort | undefined {
   if (!requested || requested === "none" || requested === "minimal") return undefined;
+  // Fixed-effort models: never send an effort anywhere (CLI --effort is a hard error).
+  if (!modelAdjustableEffort(upstreamId)) return undefined;
   const { reasoning, efforts } = modelCapabilities(upstreamId);
   if (!reasoning || efforts.length === 0) return undefined;
   if ((efforts as string[]).includes(requested)) return requested as ReasoningEffort;
@@ -95,7 +114,9 @@ export function buildCommancodexModel(
   const window = info?.contextLength ?? contextWindow ?? DEFAULT_CONTEXT_WINDOW;
   const displayName = info?.display_name ?? upstreamId.split("/").pop() ?? upstreamId;
   const levels = capabilities.reasoning
-    ? capabilities.efforts.map(effort => ({ effort, description: EFFORT_DESCRIPTIONS[effort] }))
+    ? modelAdjustableEffort(upstreamId)
+      ? capabilities.efforts.map(effort => ({ effort, description: EFFORT_DESCRIPTIONS[effort] }))
+      : [FIXED_EFFORT_LEVEL]
     : [{ effort: "low", description: "No deliberation — this model does not think." }];
   const compactLimit = Math.min(AUTO_COMPACT_TOKEN_LIMIT, Math.floor(window * 0.9));
   return {
@@ -107,7 +128,9 @@ export function buildCommancodexModel(
     supported_in_api: true,
     tool_mode: null,
     upgrade: null,
-    default_reasoning_level: capabilities.reasoning ? capabilities.efforts[capabilities.efforts.length - 1]! : "low",
+    default_reasoning_level: capabilities.reasoning && modelAdjustableEffort(upstreamId)
+      ? capabilities.efforts[capabilities.efforts.length - 1]!
+      : "low",
     supported_reasoning_levels: levels,
     context_window: window,
     max_context_window: window,
