@@ -491,8 +491,8 @@ export function createCliAdapter(options: CliAdapterOptions): ProviderAdapter {
       child.on("close", code => resolve(code));
     });
 
-    child.stdin.write(prompt);
-    await new Promise<void>(resolve => child.stdin.end(resolve));
+    child.stdin!.write(prompt);
+    await new Promise<void>(resolve => child.stdin!.end(resolve));
 
     // Stream while the CLI runs; abort kills the child.
     const exitCode = await closed;
