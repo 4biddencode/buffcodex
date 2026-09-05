@@ -463,6 +463,14 @@ export function createCliAdapter(options: CliAdapterOptions): ProviderAdapter {
 
     const stdout = child.stdout!;
     const stderrStream = child.stderr!;
+    const stdin = child.stdin!;
+    // CRITICAL: an unhandled 'error' event on any child stream (e.g. EPIPE when the
+    // client cancels mid-turn and the child is killed while stdin writes are in flight)
+    // crashes the whole bridge process. Swallow them here — the child's exit code plus
+    // whatever stdout produced decide the turn's outcome.
+    stdin.on("error", () => { /* EPIPE etc. — turn outcome comes from exit code */ });
+    stdout.on("error", () => { /* ditto */ });
+    stderrStream.on("error", () => { /* ditto */ });
     stdout.setEncoding("utf8");
     let lineBuf = "";
     stdout.on("data", (chunk: string) => {
@@ -491,8 +499,9 @@ export function createCliAdapter(options: CliAdapterOptions): ProviderAdapter {
       child.on("close", code => resolve(code));
     });
 
-    child.stdin!.write(prompt);
-    await new Promise<void>(resolve => child.stdin!.end(resolve));
+    // end() with a callback: a single atomic handoff, and the callback fires even when
+    // the child died early (the stdin error listener above absorbed the EPIPE).
+    await new Promise<void>(resolve => stdin.end(prompt, () => resolve()));
 
     // Stream while the CLI runs; abort kills the child.
     const exitCode = await closed;
