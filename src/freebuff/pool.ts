@@ -69,6 +69,14 @@ interface ManagedRun {
   finishing: boolean;
 }
 
+/** A waiter in the per-account FIFO turn-slot queue. */
+interface SlotWaiter {
+  grant: (release: () => void) => void;
+  fail: (error: Error) => void;
+  signal?: AbortSignal;
+  onAbort: (() => void) | null;
+}
+
 export interface AccountUsage {
   /** Requests served by this account since process start. */
   requestCount: number;
@@ -127,6 +135,9 @@ export class FreebuffAccount {
   private sessionLock: Promise<unknown> = Promise.resolve();
   /** One-shot guard: model_locked recovery (end + re-admit) must not loop. */
   private modelLockedRecovered = false;
+  /** Per-account FIFO turn slot: exactly one completion in flight (free_mode_run_fanout). */
+  private slotHeld = false;
+  private readonly slotWaiters: SlotWaiter[] = [];
   /** Acting-user id from GET /api/v1/me — cached forever (stable per token). */
   private userId: string | undefined;
   private cooldownUntilMs = 0;
@@ -214,21 +225,28 @@ export class FreebuffAccount {
     await this.ensureUserId(signal);
     // A real CLI client keeps exactly ONE completion in flight per account; upstream now
     // enforces that behaviorally (403 free_mode_run_fanout on a second concurrent request).
-    // Serialize: parallel Codex turns wait for the idle account here, or hop to another
-    // account via the pool's round-robin. Abort-aware so cancelled turns don't queue.
-    if (this.anyInflight()) await this.waitForIdle(signal);
-    // CLI order: the free session is admitted (and heartbeating) BEFORE any agent run
-    // starts — runs opened without an active session read as "direct API" upstream.
-    await this.ensureSession(model, signal);
-    let run = this.runs.get(agentId);
-    if (!run || Date.now() - run.startedAtMs >= this.rotationIntervalMs) {
-      run = await this.rotateAgent(agentId, signal);
+    // The turn slot is handed out atomically (no poll-then-act race): parallel Codex turns
+    // wait here, or hop to an idle account via the pool's round-robin.
+    const slotRelease = await this.acquireTurnSlot(signal);
+    try {
+      // CLI order: the free session is admitted (and heartbeating) BEFORE any agent run
+      // starts — runs opened without an active session read as "direct API" upstream.
+      await this.ensureSession(model, signal);
+      let run = this.runs.get(agentId);
+      if (!run || Date.now() - run.startedAtMs >= this.rotationIntervalMs) {
+        run = await this.rotateAgent(agentId, signal);
+      }
+      run = this.runs.get(agentId);
+      if (!run) throw new Error(`${this.name}: run missing after rotation`);
+      run.inflight += 1;
+      run.requestCount += 1;
+      return new AccountLease(this, run, slotRelease);
+    } catch (error) {
+      // Admission/rotation failed while holding the slot — free it or every later
+      // acquire queues behind a turn that will never run (fanout gate becomes a deadlock).
+      slotRelease();
+      throw error;
     }
-    run = this.runs.get(agentId);
-    if (!run) throw new Error(`${this.name}: run missing after rotation`);
-    run.inflight += 1;
-    run.requestCount += 1;
-    return new AccountLease(this, run);
   }
 
   async rotateAgent(agentId: string, signal?: AbortSignal): Promise<ManagedRun> {
@@ -462,24 +480,55 @@ export class FreebuffAccount {
     if (reason) this.lastError = reason;
   }
 
-  /** True while any completion is in flight on this account (any run). Pool-visible. */
+  /** True while a completion holds this account's turn slot. Pool-visible. */
   isBusy(): boolean {
-    return this.anyInflight();
+    return this.slotHeld;
   }
 
-  /** True while any completion is in flight on this account (any run). */
-  private anyInflight(): boolean {
-    for (const run of this.runs.values()) if (run.inflight > 0) return true;
-    for (const run of this.draining) if (run.inflight > 0) return true;
-    return false;
+  /**
+   * FIFO turn slot: atomic hand-off, no poll-then-act race. Exactly one completion at a
+   * time per account (upstream's free_mode_run_fanout gate); aborted waiters unwind.
+   */
+  private acquireTurnSlot(signal?: AbortSignal): Promise<() => void> {
+    return new Promise<() => void>((resolve, reject) => {
+      const waiter: SlotWaiter = {
+        grant: release => resolve(release),
+        fail: reject,
+        signal,
+        onAbort: null,
+      };
+      if (signal) {
+        waiter.onAbort = () => {
+          const index = this.slotWaiters.indexOf(waiter);
+          if (index !== -1) this.slotWaiters.splice(index, 1);
+          reject(new Error(`${this.name}: aborted while waiting for the account turn slot`));
+        };
+        signal.addEventListener("abort", waiter.onAbort, { once: true });
+        if (signal.aborted) {
+          waiter.onAbort();
+          return;
+      }
+      }
+      this.slotWaiters.push(waiter);
+      this.tryGrantHead();
+    });
   }
 
-  /** Poll until the account is idle; throws on abort so queued turns unwind. */
-  private async waitForIdle(signal?: AbortSignal): Promise<void> {
-    while (this.anyInflight()) {
-      if (signal?.aborted) throw new Error(`${this.name}: aborted while waiting for an idle slot`);
-      await new Promise<void>(resolve => setTimeout(resolve, 150));
-    }
+  /** Grant the slot to the head waiter if free; skip cancelled ones. */
+  private pumpSlotQueue(): void {
+    this.tryGrantHead();
+  }
+
+  private tryGrantHead(): void {
+    const head = this.slotWaiters[0];
+    if (!head || this.slotHeld) return;
+    this.slotWaiters.shift();
+    this.slotHeld = true;
+    if (head.onAbort) head.signal!.removeEventListener("abort", head.onAbort);
+    head.grant(() => {
+      this.slotHeld = false;
+      this.pumpSlotQueue();
+    });
   }
 
   async shutdown(): Promise<void> {
@@ -684,6 +733,8 @@ export class AccountLease {
   constructor(
     readonly account: FreebuffAccount,
     private readonly run: ManagedRun,
+    /** Frees the account's FIFO turn slot; idempotent — release() and invalidate() both call it. */
+    private readonly releaseSlot: () => void,
   ) {}
 
   get runId(): string {
@@ -696,11 +747,19 @@ export class AccountLease {
   }
 
   async release(): Promise<void> {
-    await this.account.release(this.run);
+    try {
+      await this.account.release(this.run);
+    } finally {
+      this.releaseSlot();
+    }
   }
 
   async invalidate(reason: string): Promise<void> {
-    await this.account.invalidate(this.run, reason);
+    try {
+      await this.account.invalidate(this.run, reason);
+    } finally {
+      this.releaseSlot();
+    }
   }
 }
 
