@@ -125,6 +125,8 @@ export class FreebuffAccount {
   private sessionModel: string | undefined;
   /** Tail of a promise chain serializing every session mutation (see lockedSessionOp). */
   private sessionLock: Promise<unknown> = Promise.resolve();
+  /** One-shot guard: model_locked recovery (end + re-admit) must not loop. */
+  private modelLockedRecovered = false;
   /** Acting-user id from GET /api/v1/me — cached forever (stable per token). */
   private userId: string | undefined;
   private cooldownUntilMs = 0;
@@ -210,6 +212,11 @@ export class FreebuffAccount {
       throw new Error(`${this.name}: cooling down until ${new Date(this.cooldownUntilMs).toISOString()}`);
     }
     await this.ensureUserId(signal);
+    // A real CLI client keeps exactly ONE completion in flight per account; upstream now
+    // enforces that behaviorally (403 free_mode_run_fanout on a second concurrent request).
+    // Serialize: parallel Codex turns wait for the idle account here, or hop to another
+    // account via the pool's round-robin. Abort-aware so cancelled turns don't queue.
+    if (this.anyInflight()) await this.waitForIdle(signal);
     // CLI order: the free session is admitted (and heartbeating) BEFORE any agent run
     // starts — runs opened without an active session read as "direct API" upstream.
     await this.ensureSession(model, signal);
@@ -449,9 +456,30 @@ export class FreebuffAccount {
   }
 
   async invalidate(run: ManagedRun, reason: string): Promise<void> {
+    if (run.inflight > 0) run.inflight -= 1;
     if (this.runs.get(run.agentId) === run) this.runs.delete(run.agentId);
     this.draining = this.draining.filter(candidate => candidate !== run);
     if (reason) this.lastError = reason;
+  }
+
+  /** True while any completion is in flight on this account (any run). Pool-visible. */
+  isBusy(): boolean {
+    return this.anyInflight();
+  }
+
+  /** True while any completion is in flight on this account (any run). */
+  private anyInflight(): boolean {
+    for (const run of this.runs.values()) if (run.inflight > 0) return true;
+    for (const run of this.draining) if (run.inflight > 0) return true;
+    return false;
+  }
+
+  /** Poll until the account is idle; throws on abort so queued turns unwind. */
+  private async waitForIdle(signal?: AbortSignal): Promise<void> {
+    while (this.anyInflight()) {
+      if (signal?.aborted) throw new Error(`${this.name}: aborted while waiting for an idle slot`);
+      await new Promise<void>(resolve => setTimeout(resolve, 150));
+    }
   }
 
   async shutdown(): Promise<void> {
@@ -559,9 +587,26 @@ export class FreebuffAccount {
           this.markCooldown(until - Date.now(), `free quota used up — resets ${new Date(until).toLocaleString()}`);
           this.emitNotification("cooldown", "warn", `free quota exhausted (${rateLimited.period}) — paused until ${new Date(until).toLocaleString()}`);
         }
+        // A live session pinned to a DIFFERENT model blocks admission (409 model_locked) —
+        // typically a session from a previous bridge process. End it and re-admit once.
+        const locked = AccountPool.parseModelLocked(error.message);
+        if (locked && !this.modelLockedRecovered) {
+          this.modelLockedRecovered = true;
+          this.emitNotification("account_error", "warn", `session locked to ${locked.currentModel} — re-admitting for ${locked.requestedModel}`);
+          try {
+            await this.client.endSession(this.token, signal);
+          } catch { /* best effort — admission below decides state */ }
+          this.session = null;
+          this.sessionModel = undefined;
+          state = await this.client.createOrRefreshSession(this.token, { model: requested, signal });
+          if (requested) this.sessionModel = requested;
+          await this.applySessionState(state, signal);
+          return;
+        }
       }
       throw error;
     }
+    this.modelLockedRecovered = false; // admission succeeded — allow future lock recovery
     await this.applySessionState(state, signal);
   }
 
@@ -704,6 +749,27 @@ export class AccountPool {
     }
   }
 
+  /** Admission refused because a live session is pinned to another model — e.g. a session
+   *  left over from a previous bridge process. Recovery: end it and re-admit fresh. */
+  static parseModelLocked(errorBody: string): { currentModel: string; requestedModel: string } | null {
+    const trimmed = errorBody.trim();
+    if (!trimmed) return null;
+    try {
+      const parsed = JSON.parse(trimmed) as {
+        status?: unknown;
+        currentModel?: unknown;
+        requestedModel?: unknown;
+      } | null;
+      if (parsed?.status !== "model_locked") return null;
+      return {
+        currentModel: typeof parsed.currentModel === "string" ? parsed.currentModel : "?",
+        requestedModel: typeof parsed.requestedModel === "string" ? parsed.requestedModel : "?",
+      };
+    } catch {
+      return null;
+    }
+  }
+
   /**
    * Parse a `rate_limited` session-admission refusal (daily/weekly free-quota exhausted).
    * Returns null when the body is not a rate_limited refusal.
@@ -742,27 +808,32 @@ export class AccountPool {
   /**
    * Round-robin across healthy accounts. Waiting-room states are skipped when other accounts
    * can serve; all-queued surfaces the best (lowest position) queue to the caller.
+   *
+   * Accounts serialize one completion at a time (free_mode_run_fanout gate), so the loop
+   * prefers IDLE accounts first and only blocks on a busy one when every account is busy —
+   * a long turn on account A must not stall a turn that account B could serve now.
    */
   async acquire(agentId: string, model?: string, signal?: AbortSignal): Promise<{ lease: AccountLease; account: FreebuffAccount }> {
     if (this.accounts.length === 0) throw new Error("no auth tokens configured");
-    const startIndex = this.nextIndex;
-    this.nextIndex = (this.nextIndex + 1) % this.accounts.length;
+    const startIndex = this.nextIndex++ % this.accounts.length;
     const waiting: WaitingRoomError[] = [];
     const errors: string[] = [];
-    for (let offset = 0; offset < this.accounts.length; offset++) {
-      const account = this.accounts[(startIndex + offset) % this.accounts.length]!;
-      try {
-        const lease = await account.acquire(agentId, model, signal);
-        return { lease, account };
-      } catch (error) {
-        if (error instanceof WaitingRoomError) {
-          waiting.push(error);
-          continue;
+    // Pass 1: idle accounts only — never queue behind a busy account while a free one exists.
+    // Pass 2: all accounts — the caller queues inside account.acquire until the account idles.
+    for (const requireIdle of [true, false]) {
+      for (let offset = 0; offset < this.accounts.length; offset++) {
+        const account = this.accounts[(startIndex + offset) % this.accounts.length]!;
+        if (requireIdle && account.isBusy()) continue;
+        try {
+          const lease = await account.acquire(agentId, model, signal);
+          return { lease, account };
+        } catch (error) {
+          if (error instanceof WaitingRoomError) waiting.push(error);
+          else errors.push(`${account.name}: ${errorText(error)}`);
         }
-        errors.push(`${account.name}: ${errorText(error)}`);
       }
     }
-    if (waiting.length === this.accounts.length && waiting.length > 0) {
+    if (waiting.length > 0) {
       const best = waiting.reduce((a, b) => (b.position > 0 && (a.position <= 0 || b.position < a.position) ? b : a));
       throw best;
     }

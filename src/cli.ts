@@ -146,55 +146,46 @@ const DEFAULT_CODEX_MODEL = "z-ai/glm-5.3-flash";
 
 /** The muxer merges the ChatGPT-app's native catalog with the Freebuff rows. The app only
  *  renders rows that carry the native schema (muxer builds those from its own template);
- *  raw 17999 rows are fine for the plain Codex CLI but invisible in the app's picker. */
+ *  raw 17999 rows are fine for the plain Codex CLI but invisible in the app's picker.
+ *  Always pinned: the muxer upstream-forwards to the bridge, so if the bridge is down
+ *  turns fail either way — a fallback route would just re-break the catalog silently. */
 const MUXER_URL = "http://127.0.0.1:17850";
 
-async function routeUrl(config: BuffcodexConfig): Promise<string> {
-  // Dialing is not binding: Codex always talks to the bridge via loopback, even when the
-  // server binds 0.0.0.0 for LAN-wide access.
-  try {
-    const response = await fetch(`${MUXER_URL}/v1/models`, { signal: AbortSignal.timeout(4_000) });
-    if (response.ok) {
-      const body = (await response.json()) as { models?: unknown[] };
-      if (Array.isArray(body.models) && body.models.length > 0) return `${MUXER_URL}/v1`;
-    }
-  } catch {
-    // muxer not running — fall through to the raw bridge
-  }
-  return `http://127.0.0.1:${config.port}/v1`;
+function routeUrl(): string {
+  return `${MUXER_URL}/v1`;
 }
 
 async function cmdCodexInstall(): Promise<void> {
   const config = ensureConfig();
-  const route = await routeUrl(config);
+  const route = routeUrl();
   let text = existsSync(CODEX_CONFIG_PATH) ? readFileSync(CODEX_CONFIG_PATH, "utf8") : "";
   const backupPath = `${CODEX_CONFIG_PATH}.buffcodex-backup`;
   if (!existsSync(backupPath)) writeFileSync(backupPath, text, { mode: 0o600 });
 
+  // Mirror codex-chatgpt-web's managed route exactly: ONLY openai_base_url. Installing a
+  // custom model_provider + provider table renames the app's provider (bottom-left shows
+  // "buffcodex") and breaks the normal-chat mode switch — with just the base URL the app
+  // keeps its built-in provider identity and every mode works.
   const managedLines = [
     ROUTE_MARKER,
     `openai_base_url = "${route}"`,
-    "model_provider = \"buffcodex\"",
-    "",
-    "[model_providers.buffcodex]",
-    "name = \"Buffcodex\"",
-    `base_url = "${route}"`,
-    "wire_api = \"responses\"",
-    "requires_openai_auth = false",
   ];
 
   const lines = text.split("\n");
-  // 1) Strip the previous managed region: from the marker to the next real table header
-  //    ([model_providers.buffcodex] belongs to us and does not end the region).
+  // 1) Strip the previous managed region: from the marker to the next table header.
   const markerIndex = lines.findIndex(line => line.trim() === ROUTE_MARKER);
   if (markerIndex !== -1) {
     let end = markerIndex + 1;
-    while (end < lines.length) {
-      const trimmed = lines[end]!.trim();
-      if (trimmed.startsWith("[") && !trimmed.startsWith("[model_providers.buffcodex]")) break;
-      end++;
-    }
+    while (end < lines.length && !lines[end]!.trim().startsWith("[")) end++;
     lines.splice(markerIndex, end - markerIndex);
+  }
+  // 1b) Remove the legacy provider table from older installs: it renamed the app's
+  //     provider ("buffcodex" bottom-left) and broke the normal-chat mode switch.
+  const legacyTable = lines.findIndex(line => line.trim() === "[model_providers.buffcodex]");
+  if (legacyTable !== -1) {
+    let end = legacyTable + 1;
+    while (end < lines.length && !lines[end]!.trim().startsWith("[")) end++;
+    lines.splice(legacyTable, end - legacyTable);
   }
   // 2) Ensure a valid default `model` exists. A top-level `model = "chatgpt-web/…"` is stale
   //    (that provider no longer exists) and gets replaced; a missing model gets the default;
@@ -218,7 +209,7 @@ async function cmdCodexInstall(): Promise<void> {
     if (!insideTable && /^model_reasoning_effort\s*=/.test(trimmed)) lines.splice(i, 1);
   }
   if (needsDefaultModel) {
-    managedLines.splice(3, 0, `model = "${DEFAULT_CODEX_MODEL}"`);
+    managedLines.push(`model = "${DEFAULT_CODEX_MODEL}"`);
   }
   // 3) Top-level keys are only valid BEFORE the first table header — insert there, not at EOF.
   const firstTable = lines.findIndex(line => line.trim().startsWith("["));

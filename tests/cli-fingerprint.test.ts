@@ -96,19 +96,24 @@ describe("CLI fingerprint: session contract", () => {
     const account = makeAccount("account-1", fake);
     const pool = new AccountPool([account]);
 
-    await pool.acquire("base2-free", "z-ai/glm-5.3-flash", new AbortController().signal);
+    // Acquires serialize per account now: each lease is released before the next
+    // acquire, mirroring the adapter's one-completion-at-a-time contract.
+    const first = await pool.acquire("base2-free", "z-ai/glm-5.3-flash", new AbortController().signal);
     expect(fake.sessionPosts).toEqual(["z-ai/glm-5.3-flash"]);
     expect(fake.endSessions).toBe(0);
+    await first.lease.release();
 
     // Same model again: no rejoin.
-    await pool.acquire("base2-free", "z-ai/glm-5.3-flash", new AbortController().signal);
+    const second = await pool.acquire("base2-free", "z-ai/glm-5.3-flash", new AbortController().signal);
     expect(fake.endSessions).toBe(0);
     expect(fake.sessionPosts).toHaveLength(1);
+    await second.lease.release();
 
     // Different model: end + re-POST with the new model.
-    await pool.acquire("base2-free", "openai/gpt-5.6-luna", new AbortController().signal);
+    const third = await pool.acquire("base2-free", "openai/gpt-5.6-luna", new AbortController().signal);
     expect(fake.endSessions).toBe(1);
     expect(fake.sessionPosts).toEqual(["z-ai/glm-5.3-flash", "openai/gpt-5.6-luna"]);
+    await third.lease.release();
     await pool.shutdown();
   });
 
