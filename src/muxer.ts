@@ -210,6 +210,15 @@ const server = Bun.serve({
       return Response.json(catalog);
     }
     if (path.startsWith("/v1/")) {
+      // Codex probes GET /v1/responses to negotiate a WebSocket transport. Refuse with
+      // 426 (like codex-chatgpt-web does) so the app falls back to POST + SSE, which is
+      // what the bridge serves.
+      if (path === "/v1/responses" && request.method === "GET") {
+        return new Response("Responses WebSocket transport is not enabled on this local route", {
+          status: 426,
+          headers: { "content-type": "text/plain; charset=utf-8" },
+        });
+      }
       const bodyBytes = request.method === "GET" || request.method === "HEAD"
         ? undefined
         : new Uint8Array(await request.arrayBuffer());
