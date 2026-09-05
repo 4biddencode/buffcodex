@@ -44,6 +44,14 @@ export interface CommandCodexConfig {
   apiKey: string;
   /** Provider API base override (default https://api.commandcode.ai). */
   providerBaseUrl?: string;
+  /**
+   * Upstream transport. "api" = the Provider REST endpoints (needs a plan with API
+   * access). "cli" = drive the official command-code CLI headless (`cmd -p`), which
+   * works on every plan and is their documented automation surface. Default: "api".
+   */
+  transport?: "api" | "cli";
+  /** CLI binary override for transport=cli (default "cmd" resolved on PATH). */
+  cliPath?: string;
   /** Upstream HTTP timeout for a full streaming turn. */
   requestTimeoutMs: number;
   /** Optional client API keys for proxy auth (empty = open loopback access). */
@@ -136,6 +144,8 @@ export function parseConfig(value: unknown, source: string, requireKey = false):
     port: raw.port as number,
     apiKey,
     ...(providerBaseCandidate ? { providerBaseUrl } : {}),
+    ...(raw.transport === "cli" || raw.transport === "api" ? { transport: raw.transport } : {}),
+    ...(typeof raw.cliPath === "string" && raw.cliPath.trim() ? { cliPath: raw.cliPath.trim() } : {}),
     requestTimeoutMs: Number.isFinite(raw.requestTimeoutMs) && (raw.requestTimeoutMs as number) > 0
       ? raw.requestTimeoutMs as number
       : DEFAULT_REQUEST_TIMEOUT_MS,

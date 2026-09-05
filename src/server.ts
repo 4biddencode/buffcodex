@@ -12,6 +12,8 @@ import type { AdapterEvent, CodexParsedRequest } from "./types";
 import type { ProviderAdapter } from "./adapters/base";
 import { createCommancodexAdapter } from "./commancodex";
 import { CommancodexClient } from "./commancodex/client";
+import { createCliAdapter } from "./cli-transport/adapter";
+import { resolveReasoningEffort } from "./models-catalog";
 import { errorText } from "./lib/errors";
 import { buildResponseJSON, bridgeToResponsesSSE } from "./bridge";
 import type { CommandCodexConfig } from "./config";
@@ -42,10 +44,18 @@ export function createRuntime(config: CommandCodexConfig): Runtime {
     requestTimeoutMs: config.requestTimeoutMs,
     ...(config.httpProxy ? { httpProxy: config.httpProxy } : {}),
   });
-  const adapter = createCommancodexAdapter({
+  const strip = (modelId: string) => modelId.startsWith("commancodex/") ? modelId.slice("commancodex/".length) : modelId;
+  const apiAdapter = createCommancodexAdapter({
     client,
-    resolveUpstreamModel: modelId => modelId.startsWith("commancodex/") ? modelId.slice("commancodex/".length) : modelId,
+    resolveUpstreamModel: strip,
   });
+  const cliAdapter = createCliAdapter({
+    apiKey: config.apiKey,
+    ...(config.cliPath ? { cliPath: config.cliPath } : {}),
+    resolveCliModel: strip,
+    resolveEffort: (modelId, requested) => resolveReasoningEffort(modelId, requested),
+  });
+  const adapter = config.transport === "cli" ? cliAdapter : apiAdapter;
   return {
     config,
     client,
@@ -289,6 +299,10 @@ async function handleValidateKey(request: Request, runtime: Runtime): Promise<Re
  * every 10 minutes; failure keeps the last list (or the static fallback rows).
  */
 export async function refreshProviderModels(runtime: Runtime): Promise<number> {
+  if (runtime.config.transport === "cli") {
+    // The CLI transport has no models endpoint to poll; the static catalog stands.
+    return runtime.providerRows.length;
+  }
   try {
     const rows = (await runtime.client.listModels())
       .filter(row => typeof row.id === "string" && row.id.length > 0);

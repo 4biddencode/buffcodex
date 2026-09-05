@@ -101,19 +101,45 @@ async function cmdModels(): Promise<void> {
   for (const row of runtime.providerRows) console.info(`  commancodex/${row.id}`);
 }
 
+async function cmdTransport(transportArg: string | undefined): Promise<void> {
+  const transport = transportArg?.trim();
+  if (transport !== "api" && transport !== "cli") {
+    fail("usage: commandcodex transport <api|cli>\n  api = Provider REST endpoints (needs a plan with API access)\n  cli = drive the official command-code CLI headless (works on every plan)");
+  }
+  const config = ensureConfig();
+  config.transport = transport;
+  saveConfig(config);
+  console.info(`transport set to ${transport}`);
+  if (transport === "cli") {
+    console.info("the official CLI (cmd) must be installed: npm i -g command-code (or bun add -g command-code)");
+    console.info("auth uses the same key via the COMMAND_CODE_API_KEY env var automatically");
+  }
+}
+
 async function cmdDoctor(): Promise<void> {
   const config = ensureConfig();
   console.info(`config: ${getConfigPath()} (version ${config.version})`);
   console.info(`provider: ${config.providerBaseUrl ?? "https://api.commandcode.ai"}`);
+  console.info(`transport: ${config.transport ?? "api"}`);
   console.info(`key: ${config.apiKey ? maskToken(config.apiKey) : "MISSING"}`);
   if (config.apiKey) {
-    try {
-      const models = await clientFor(config).listModels();
-      console.info(`  provider: ok (${models.length} models)`);
-    } catch (error) {
-      console.info(`  provider: FAILED — ${error instanceof Error ? error.message : String(error)}`);
-    }
+  try {
+    const models = await clientFor(config).listModels();
+    console.info(`  provider: ok (${models.length} models)`);
+  } catch (error) {
+    console.info(`  provider: FAILED — ${error instanceof Error ? error.message : String(error)}`);
   }
+  if ((config.transport ?? "api") === "cli") {
+    const { execFile } = await import("node:child_process");
+    const cliPath = config.cliPath ?? "cmd";
+    await new Promise<void>(resolve => {
+      execFile(cliPath, ["--version"], { env: { ...process.env, PATH: `${process.env.HOME}/.bun/bin:/opt/homebrew/opt/node/bin:${process.env.PATH ?? ""}` } }, error => {
+        console.info(`  cli (${cliPath}): ${error ? "NOT FOUND — install with 'bun add -g command-code'" : "ok"}`);
+        resolve();
+      });
+    });
+  }
+}
   console.info(`codex config: ${CODEX_CONFIG_PATH}`);
   if (existsSync(CODEX_CONFIG_PATH)) {
     const text = readFileSync(CODEX_CONFIG_PATH, "utf8");
@@ -283,6 +309,9 @@ COMMANDS
   set <api-key>              Save + validate the Command Code Provider API key
                              (commandcode.ai → Studio → API keys).
   remove-key                 Remove the stored Provider API key.
+  transport <api|cli>        Upstream transport: "api" = Provider REST (needs a plan
+                             with API access); "cli" = drive the official command-code
+                             CLI headless — works on EVERY plan, including Go.
   serve                      Start the Responses bridge (default port 17999).
   models                     List the models exposed to Codex (live provider catalog).
   doctor                     Validate key, provider reachability, and Codex routing.
@@ -313,6 +342,7 @@ async function main(): Promise<void> {
     case "serve": return cmdServe();
     case "set": return cmdSet(args[0]);
     case "remove-key": return cmdRemoveKey();
+    case "transport": return cmdTransport(args[0]);
     case "models": return cmdModels();
     case "doctor": return cmdDoctor();
     case "codex":
